@@ -1,0 +1,17 @@
+[package]
+name = "cryptocensus"
+version = "1.0.0"
+edition = "2021"
+description = "Native crypto-posture scanner: SSH algorithm inventory with post-quantum readiness scoring and CycloneDX CBOM"
+
+[dependencies]
+serde_json = "1"
+# batch-GCD (O8) needs arbitrary-precision integers for real RSA moduli;
+# everything else is std.
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
