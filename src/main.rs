@@ -594,38 +594,130 @@ fn ctype_label(c: &str) -> &'static str {
 }
 fn esc(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;") }
 
-fn build_html(recs: &[Record], stamp: &str) -> String {
+// ---------- HTML dashboard (self-contained, offline, dark to match the slides) ----------
+// Every string that came from a server, an inventory file or the model goes through esc().
+const DASH_CSS: &str = "*{box-sizing:border-box}body{margin:0;background:#0D1021;color:#F2F3F8;font:14px/1.5 -apple-system,'Segoe UI',Arial,sans-serif}\
+.wrap{max-width:1120px;margin:0 auto;padding:28px 24px 40px}\
+.top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;border-bottom:1px solid #1E2440;padding-bottom:14px}\
+.brand{font-weight:800;letter-spacing:.14em;font-size:20px}.sub{color:#2EC4B6;font-weight:600}.meta{color:#9AA0B5;margin-left:auto;font-size:13px}\
+.hero{display:grid;grid-template-columns:auto 1fr auto;gap:28px;align-items:center;margin:26px 0}\
+.badge{width:112px;height:112px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:64px;font-weight:800;color:#0D1021}\
+.big{font-size:44px;font-weight:800;line-height:1}.big span{font-size:20px;color:#9AA0B5;font-weight:600}.label{color:#9AA0B5;margin:4px 0 12px}\
+.stack{display:flex;height:14px;border-radius:7px;overflow:hidden;background:#1E2440}.stack span{display:block;height:100%}\
+.legend{display:flex;gap:16px;flex-wrap:wrap;color:#9AA0B5;font-size:12px;margin-top:8px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}\
+.stats{display:grid;grid-template-columns:repeat(2,minmax(130px,1fr));gap:10px}\
+.stat{background:#161A2E;border:1px solid #1E2440;border-left:4px solid var(--c);border-radius:10px;padding:10px 14px}\
+.stat b{display:block;font-size:26px;color:var(--c);line-height:1.1}.stat small{color:#9AA0B5}\
+.card{background:#161A2E;border:1px solid #1E2440;border-radius:12px;padding:18px 20px;margin:14px 0}\
+.card h2{margin:0 0 10px;font-size:16px;display:flex;align-items:center;gap:12px}\
+.mini{width:38px;height:38px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:800;color:#0D1021;font-size:20px}\
+.muted{color:#9AA0B5}.counts{color:#9AA0B5;font-size:13px;margin:8px 0 0}.tag{font-size:12px;font-weight:700;letter-spacing:.08em}\
+.ai{border-left:4px solid #8B6CFF}.ai .tag{color:#8B6CFF}.plan .tag{color:#2EC4B6}\
+details{margin-top:12px}summary{cursor:pointer;color:#2EC4B6;font-weight:600}\
+table{border-collapse:collapse;width:100%;margin-top:10px;font-size:13px}th{color:#9AA0B5;text-align:left;font-weight:600;border-bottom:1px solid #1E2440;padding:6px 8px}\
+td{border-bottom:1px solid #1E2440;padding:6px 8px;vertical-align:top}\
+.pill{display:inline-block;padding:1px 8px;border-radius:9px;font-size:12px;font-weight:600;color:#0D1021;white-space:nowrap}\
+code{font-family:Consolas,Menlo,monospace;font-size:12.5px;color:#C9D1E8}ol{margin:8px 0 0 18px;padding:0}li{margin:5px 0}\
+footer{color:#7A8794;font-size:12px;margin-top:28px;border-top:1px solid #1E2440;padding-top:12px}\
+@media(max-width:760px){.hero{grid-template-columns:1fr}.meta{margin-left:0}}";
+
+const BANDS: [&str; 5] = ["broken", "legacy-classical", "quantum-vulnerable", "pq-ready", "unclassified"];
+fn dash_color(cat: &str) -> &'static str {
+    match cat { "broken" => "#E24A4A", "legacy-classical" => "#E6922E", "quantum-vulnerable" => "#E8C13A", "pq-ready" => "#2FB37A", _ => "#7A8794" }
+}
+fn grade_color(g: &str) -> &'static str {
+    match g { "A" | "B" => "#2FB37A", "C" => "#E8C13A", "D" => "#E6922E", _ => "#E24A4A" }
+}
+fn band_counts(rs: &[&Record]) -> BTreeMap<&'static str, usize> {
+    let mut c = BTreeMap::new();
+    for r in rs {
+        let k = BANDS.iter().copied().find(|b| *b == r.category).unwrap_or("unclassified");
+        *c.entry(k).or_insert(0) += 1;
+    }
+    c
+}
+fn stack_bar(c: &BTreeMap<&'static str, usize>, total: usize) -> String {
+    let mut s = String::from("<div class=\"stack\">");
+    for b in BANDS {
+        let n = *c.get(b).unwrap_or(&0);
+        if n == 0 || total == 0 { continue; }
+        s.push_str(&format!("<span style=\"width:{:.3}%;background:{}\" title=\"{b}: {n}\"></span>", 100.0 * n as f64 / total as f64, dash_color(b)));
+    }
+    s.push_str("</div>");
+    s
+}
+// escape, then turn `code` spans into <code>
+fn esc_code(s: &str) -> String {
+    let mut out = String::new();
+    let mut open = false;
+    for ch in esc(s).chars() {
+        if ch == '`' { out.push_str(if open { "</code>" } else { "<code>" }); open = !open; } else { out.push(ch); }
+    }
+    if open { out.push_str("</code>"); }
+    out
+}
+
+struct Brief<'a> { summary: &'a str, author: &'a str, plan: &'a str }
+fn build_html(recs: &[Record], stamp: &str) -> String { build_dashboard(recs, stamp, None) }
+fn build_dashboard(recs: &[Record], stamp: &str, brief: Option<Brief>) -> String {
     let mut hosts: BTreeMap<String, Vec<&Record>> = BTreeMap::new();
     for r in recs { hosts.entry(r.host.clone()).or_default().push(r); }
-    let mut h = String::new();
-    h.push_str("<!doctype html><html><head><meta charset=\"utf-8\"><title>CryptoCensus report</title><style>");
-    h.push_str("body{font:14px/1.5 -apple-system,Arial,sans-serif;margin:24px;color:#222}h1{font-size:20px}h2{font-size:16px;margin-top:22px}");
-    h.push_str("table{border-collapse:collapse;margin:8px 0;width:100%}td,th{border:1px solid #ccc;padding:5px 8px;text-align:left;font-size:13px}");
-    h.push_str("th{background:#f2f2f2}.pill{color:#fff;padding:2px 7px;border-radius:9px;font-size:12px}td.port{white-space:nowrap}</style></head><body>");
-    h.push_str(&format!("<h1>CryptoCensus: lab cryptography readiness</h1><p>Generated {stamp}</p>"));
-    for (host, rs) in &hosts {
-        let worst = rs.iter().map(|r| r.category.as_str()).max_by_key(|c| severity(c)).unwrap_or("pq-ready");
-        let score = readiness(rs);
-        let (g, _) = grade(score);
-        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-        for r in rs { *counts.entry(r.category.as_str()).or_insert(0) += 1; }
-        h.push_str(&format!(
-            "<h2>{host} <span class=\"pill\" style=\"background:{}\">grade {g}  readiness {score:.0}/100  (worst: {worst})</span></h2>",
-            color_hex(worst)));
-        let cstr: Vec<String> = counts.iter().map(|(k, v)| format!("{k}: {v}")).collect();
-        h.push_str(&format!("<p>{}</p>", cstr.join(", ")));
-        h.push_str("<table><tr><th>Port</th><th>Type</th><th>Algorithm</th><th>Category</th><th>Why</th><th>Source</th></tr>");
-        let mut sorted = rs.clone();
-        sorted.sort_by(|a, b| a.ctype.cmp(&b.ctype));
-        for r in sorted {
-            h.push_str(&format!(
-                "<tr><td class=\"port\">{}/{}</td><td>{}</td><td>{}</td><td><span class=\"pill\" style=\"background:{}\">{}</span></td><td>{}</td><td>{}</td></tr>",
-                r.port, esc(&r.service), ctype_label(&r.ctype), esc(&r.value),
-                color_hex(&r.category), r.category, esc(&r.why), esc(&r.source)));
-        }
-        h.push_str("</table>");
+    let all: Vec<&Record> = recs.iter().collect();
+    let os = readiness(&all);
+    let (og, _) = grade(os);
+    let oc = band_counts(&all);
+    let get = |c: &BTreeMap<&'static str, usize>, k: &str| *c.get(k).unwrap_or(&0);
+    let mut h = String::with_capacity(16384);
+    h.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>CryptoCensus report</title><style>");
+    h.push_str(DASH_CSS);
+    h.push_str("</style></head><body><div class=\"wrap\">");
+    h.push_str(&format!("<div class=\"top\"><span class=\"brand\">CRYPTOCENSUS</span><span class=\"sub\">post-quantum readiness report</span><span class=\"meta\">generated {} &nbsp;|&nbsp; {} host(s) &nbsp;|&nbsp; {} parameter(s)</span></div>",
+        esc(stamp), hosts.len(), recs.len()));
+    h.push_str(&format!("<div class=\"hero\"><div class=\"badge\" style=\"background:{}\">{og}</div><div><div class=\"big\">{os:.0}<span>/100</span></div><div class=\"label\">overall post-quantum readiness</div>{}<div class=\"legend\">",
+        grade_color(og), stack_bar(&oc, recs.len())));
+    for b in BANDS.iter().take(4) { h.push_str(&format!("<span><i class=\"dot\" style=\"background:{}\"></i>{b} {}</span>", dash_color(b), get(&oc, b))); }
+    h.push_str("</div></div><div class=\"stats\">");
+    for (b, label) in [("broken", "broken today"), ("legacy-classical", "legacy, phase out"), ("quantum-vulnerable", "broken later (Shor or Grover)"), ("pq-ready", "post-quantum ready")] {
+        h.push_str(&format!("<div class=\"stat\" style=\"--c:{}\"><b>{}</b><small>{label}</small></div>", dash_color(b), get(&oc, b)));
     }
-    h.push_str("</body></html>");
+    h.push_str("</div></div>");
+    if let Some(b) = &brief {
+        h.push_str(&format!("<div class=\"card ai\"><div class=\"tag\">EXECUTIVE SUMMARY</div><p>{}</p><div class=\"muted\" style=\"font-size:12px\">{}</div></div>",
+            esc(b.summary).replace('\n', "<br>"), esc(b.author)));
+        h.push_str("<div class=\"card plan\"><div class=\"tag\">REMEDIATION PLAN, COMPUTED BY THE ENGINE, MOST URGENT FIRST</div><ol>");
+        let mut tail = String::new();
+        for line in b.plan.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            match line.split_once(". ") {
+                Some((num, rest)) if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => h.push_str(&format!("<li>{}</li>", esc_code(rest))),
+                _ => tail.push_str(&format!("<p class=\"muted\">{}</p>", esc_code(line))),
+            }
+        }
+        h.push_str("</ol>");
+        h.push_str(&tail);
+        h.push_str("</div>");
+    }
+    // hosts, worst first; the worst host's table starts open
+    let mut order: Vec<(&String, &Vec<&Record>, f64)> = hosts.iter().map(|(k, v)| (k, v, readiness(v))).collect();
+    order.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, (host, rs, sc)) in order.into_iter().enumerate() {
+        let (g, _) = grade(sc);
+        let c = band_counts(rs);
+        h.push_str(&format!("<div class=\"card\"><h2><span class=\"mini\" style=\"background:{}\">{g}</span>{} <span class=\"muted\" style=\"font-weight:400\">readiness {sc:.0}/100</span></h2>{}",
+            grade_color(g), esc(host), stack_bar(&c, rs.len())));
+        let parts: Vec<String> = BANDS.iter().filter(|b| get(&c, b) > 0).map(|b| format!("{} {b}", get(&c, b))).collect();
+        h.push_str(&format!("<div class=\"counts\">{}</div>", parts.join(", ")));
+        h.push_str(&format!("<details{}><summary>{} algorithm(s)</summary><table><tr><th>Port</th><th>Type</th><th>Algorithm</th><th>Band</th><th>Why</th><th>Source</th></tr>",
+            if i == 0 { " open" } else { "" }, rs.len()));
+        let mut sorted: Vec<&Record> = rs.to_vec();
+        sorted.sort_by(|a, b| severity(&b.category).cmp(&severity(&a.category)).then(a.ctype.cmp(&b.ctype)));
+        for r in sorted {
+            h.push_str(&format!("<tr><td>{}/{}</td><td>{}</td><td><code>{}</code></td><td><span class=\"pill\" style=\"background:{}\">{}</span></td><td>{}</td><td class=\"muted\">{}</td></tr>",
+                r.port, esc(&r.service), ctype_label(&r.ctype), esc(&r.value), dash_color(&r.category), esc(&r.category), esc(&r.why), esc(&r.source)));
+        }
+        h.push_str("</table></details></div>");
+    }
+    h.push_str("<footer>Bands follow NIST SP 800-131A, NIST IR 8547 (draft) and NIST FIPS 203, and every rule cites its source. The grade and the plan are computed by the engine; an AI summary, when present, was checked against it. Generated by CryptoCensus, github.com/MaqsatKendjebekov/cryptocensus</footer>");
+    h.push_str("</div></body></html>");
     h
 }
 
@@ -2025,13 +2117,14 @@ fn ai_report_cmd(outdir: &str, use_ai: bool) {
     out.push_str(&format!("\n## Executive summary ({author})\n\n"));
     out.push_str(&summary);
     out.push_str("\n\n## Remediation plan (computed by the engine, most urgent first)\n\n");
-    out.push_str(&remediation_plan(&recs));
+    let plan = remediation_plan(&recs);
+    out.push_str(&plan);
     let path = format!("{outdir}/executive_brief.md");
     write_file(&path, &out);
     println!("\n{out}");
     // the colour-coded heatmap, rebuilt from the same inventory the brief used
     let heat = format!("{outdir}/heatmap.html");
-    write_file(&heat, &build_html(&recs, &now_iso()));
+    write_file(&heat, &build_dashboard(&recs, &now_iso(), Some(Brief { summary: &summary, author: &author, plan: &plan })));
     println!("  {} {path} | {heat}", dim("written:"));
 }
 
