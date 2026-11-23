@@ -149,6 +149,14 @@ whole read-only audit and prints one JSON summary. For Claude Code:
 ln -s "$PWD/skills/cryptocensus" ~/.claude/skills/cryptocensus
 ```
 
+## Related tools
+
+ssh-audit rates SSH algorithms and warns on non post-quantum key exchange; pqcscan lists
+which post-quantum algorithms SSH and TLS servers offer; IBM's CBOM Kit builds CBOMs from
+source code. CryptoCensus aims at the verified loop on the network side: per-slot verdicts
+for SSH and TLS, a CBOM, a live proof with the server's signed key exchange, a generated fix
+checked against a re-scan, and a regression gate.
+
 ## Testing against OpenSSH 9.8 or newer
 
 OpenSSH 9.8+ penalises clients that connect repeatedly without logging in

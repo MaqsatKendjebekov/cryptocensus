@@ -1112,21 +1112,30 @@ fn predicted_grade(policy: &Value) -> (f64, &'static str) {
     let s = readiness_cat(&cats);
     (s, grade(s).0)
 }
-fn hardened_conf(host: &str, file: &str) -> String {
+fn hardened_conf(host: &str, port: u16, file: &str) -> String {
     format!(
 "# CryptoCensus post-quantum hardening drop-in for {host}
-# Needs OpenSSH 9.9 or newer (mlkem768x25519-sha256); `sshd -t` rejects it on older versions.
-# Install:  sudo cp {file} /etc/ssh/sshd_config.d/99-cryptocensus.conf  &&  sudo sshd -t  &&  sudo systemctl reload ssh
-# Verify:   cryptocensus scan --targets {host} --out after  &&  cryptocensus diff before/inventory.json after/inventory.json
+# The server needs OpenSSH 9.9 or newer (mlkem768x25519-sha256); `sshd -t` rejects it on older versions.
+# Side effects: clients need sntrup761 (OpenSSH 8.5+) or ML-KEM (9.9+) key exchange, and only the
+#   ssh-ed25519 host key is offered. User login keys are not touched.
+# sshd uses the FIRST value it reads for each keyword, so these lines must come before any other
+#   KexAlgorithms, Ciphers, MACs or HostKeyAlgorithms line. Check what wins before reloading:
+#   sshd -T | grep -iE '^(kexalgorithms|ciphers|macs|hostkeyalgorithms)'
+# Debian or Ubuntu system sshd (its sshd_config includes sshd_config.d at the top):
+#   sudo cp {file} /etc/ssh/sshd_config.d/00-cryptocensus.conf && sudo sshd -t && sudo systemctl reload ssh
+# A server started with `sshd -f FILE`: copy this file next to FILE (an Include of a missing
+#   file passes sshd -t and silently changes nothing), make `Include <that copy>` the first line
+#   of FILE, check sshd -T -f FILE as above, then reload it with kill -HUP $(cat <its PidFile>).
+# Back up the config first (cp FILE FILE.bak); to roll back, restore it and reload.
+# Verify: cryptocensus scan --targets {host} --port {port} --out after && cryptocensus diff before/inventory.json after/inventory.json --fail-on-regression
 # Host key: ssh-ed25519 stays so every client can connect. OpenSSH 10.4 added the post-quantum
-#   ssh-mldsa44-ed25519 as an opt-in and 10.6 enables it by default. When your clients are there:
-#   ssh-keygen -t mldsa44-ed25519 -f /etc/ssh/ssh_host_mldsa44_ed25519_key, add it as a HostKey
-#   and list it first in HostKeyAlgorithms.
+#   ML-DSA host key as an opt-in (ssh-mldsa44-ed25519@openssh.com, see `ssh -Q key`) and 10.6
+#   enables it by default. When your clients are there: ssh-keygen -t mldsa44-ed25519 -f
+#   /etc/ssh/ssh_host_mldsa44_ed25519_key, add it as a HostKey and list it first in HostKeyAlgorithms.
 KexAlgorithms {HARDENED_KEX}
 Ciphers {HARDENED_CIPHERS}
 MACs {HARDENED_MACS}
 HostKeyAlgorithms {HARDENED_HOSTKEY}
-PubkeyAcceptedAlgorithms {HARDENED_HOSTKEY}
 ")
 }
 // algorithm names the generated config keeps (they are not "to drop", even if not pq-ready)
@@ -1155,9 +1164,9 @@ fn fix_cmd(targets: &str, port: u16, timeout: Duration, workers: usize, policy: 
         let (bg, _) = grade(before);
         let drop: Vec<&&Record> = rs.iter().filter(|r| r.category != "pq-ready" && !hardened_keeps(&r.value)).collect();
         let kept_weak: Vec<&&Record> = rs.iter().filter(|r| r.category != "pq-ready" && hardened_keeps(&r.value)).collect();
-        let file = format!("{host}_99-cryptocensus.conf");
+        let file = format!("{host}_00-cryptocensus.conf");   // 00-: sshd keeps the first value it reads
         let path = format!("{dir}/{file}");
-        write_file(&path, &hardened_conf(host, &file));
+        write_file(&path, &hardened_conf(host, port, &file));
         out!("\n  {} {}", bold("host"), bold(host));
         out!("    now {} {:.0}/100, {} weak parameter(s) to drop:",
                  paint(&format!(" {bg} "), cat_bg_for_grade(bg)), before, drop.len());
@@ -1171,13 +1180,17 @@ fn fix_cmd(targets: &str, port: u16, timeout: Duration, workers: usize, policy: 
         }
         let item = |r: &&&Record| json!({"ctype": r.ctype, "value": r.value, "category": r.category});
         hosts_json.push(json!({"host": host, "current": grade_json(before), "predicted": grade_json(pred_s),
-            "drop": drop.iter().map(item).collect::<Vec<_>>(), "kept": kept_weak.iter().map(item).collect::<Vec<_>>(), "file": path}));
+            "drop": drop.iter().map(item).collect::<Vec<_>>(), "kept": kept_weak.iter().map(item).collect::<Vec<_>>(), "file": path,
+            "side_effects": ["clients need sntrup761 (OpenSSH 8.5+) or ML-KEM (OpenSSH 9.9+) key exchange; older clients cannot connect",
+                             "only the ssh-ed25519 host key is offered; a client that accepts only RSA or ECDSA host keys cannot connect",
+                             "the server itself needs OpenSSH 9.9+; sshd -t rejects the file on older versions"],
+            "install": "sshd keeps the first value it reads: the file must be included before any other KexAlgorithms, Ciphers, MACs or HostKeyAlgorithms line; check with sshd -T | grep -iE '^(kexalgorithms|ciphers|macs|hostkeyalgorithms)' before reloading"}));
         out!("    {} {} {:.0}/100 after applying {}", paint("=>", "92"),
                  paint(&format!(" {pred_g} "), cat_bg_for_grade(pred_g)), pred_s, dim(&path));
     }
     out!("\n  {} drop-in configs in {dir}/. Apply, re-scan, and `cryptocensus diff` to prove the lift.\n", dim("written:"));
     emit_json(&json!({"command": "fix", "port": port, "hosts": hosts_json,
-        "next": "review the drop-in, install it with sshd -t, re-scan, then cryptocensus diff before/inventory.json after/inventory.json --fail-on-regression"}));
+        "next": format!("after approval: install the drop-in first in the config, sshd -t, reload, then cryptocensus scan --targets <host> --port {port} --out <new dir> and cryptocensus diff <old dir>/inventory.json <new dir>/inventory.json --fail-on-regression")}));
 }
 
 // ----- Feature 2: drift. Diff two inventories and fail CI on a regression -----
@@ -1655,7 +1668,8 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
         if probes.is_empty() {
             out!("    {} no weak kex/cipher/mac in the offer", paint("ok", "92"));
             let wo = live_downgrade(*ip, port, "diffie-hellman-group1-sha1", &hk, "3des-cbc", "hmac-md5", timeout);
-            hosts_json.push(json!({"host": ip.to_string(), "answered": true, "probes": [], "accepted": 0, "completed": 0,
+            hosts_json.push(json!({"host": ip.to_string(), "answered": true, "probes": [],
+                "counts": {"agreed": 0, "completed": 0, "refused": 0, "inconclusive": 0, "not_probed": 0},
                 "weak_only_proposal": vname(&wo), "note": "the server lists no broken or legacy kex, cipher or MAC"}));
             match wo {
                 Down::Refused => out!("    {} weak-only proposal refused (server disconnect)", paint(" refused ", "1;37;42")),
@@ -1669,7 +1683,7 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
             }
             continue;
         }
-        let (total, mut acc, mut done, mut unk) = (probes.len(), 0, 0, 0);
+        let (total, mut acc, mut done, mut unk, mut refd) = (probes.len(), 0, 0, 0, 0);
         let mut probes_json: Vec<Value> = Vec::new();
         for pr in probes {
             let (cat, _, _) = score(policy, pr.ctype, &pr.weak);
@@ -1685,15 +1699,15 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
             match v {
                 Down::Completed => { acc += 1; done += 1; out!("      {} {k} / {c} / {m}", paint(" DOWNGRADE ACCEPTED ", "1;37;41")) }
                 Down::Accepted => { acc += 1; out!("      {} {k} / {c} / {m} {}", paint(" DOWNGRADE ACCEPTED ", "1;37;41"), dim("(negotiated, no signed reply)")) }
-                Down::Refused  => out!("      {} {k} / {c} / {m}", paint(" refused ", "1;37;42")),
+                Down::Refused  => { refd += 1; out!("      {} {k} / {c} / {m}", paint(" refused ", "1;37;42")) }
                 Down::Unknown  => { unk += 1; out!("      {} live probe inconclusive", dim("note")) }
             }
         }
         let mut tail = String::new();
         if unk > 0 { tail.push_str(&format!(", {unk} inconclusive")); }
         if skipped > 0 { tail.push_str(&format!(", {skipped} more not probed (cap 32)")); }
-        hosts_json.push(json!({"host": ip.to_string(), "answered": true, "probes": probes_json, "accepted": acc, "completed": done,
-            "inconclusive": unk, "not_probed": skipped}));
+        hosts_json.push(json!({"host": ip.to_string(), "answered": true, "probes": probes_json,
+            "counts": {"agreed": acc, "completed": done, "refused": refd, "inconclusive": unk, "not_probed": skipped}}));
         if acc == 0 {
             out!("    {} 0 of {total} weak probes accepted{tail}", paint("=>", if unk == 0 { "92" } else { "93" }));
         } else {
@@ -1707,8 +1721,10 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
         json_fail("downgrade", "no SSH service answered", 2);
     }
     emit_json(&json!({"command": "downgrade", "port": port,
-        "verdicts": {"completed": "accepted, and the server sent its signed key exchange reply", "accepted": "the server agreed to the weak proposal, no signed reply",
+        "verdicts": {"completed": "the server agreed to the weak proposal and sent its signed key exchange reply",
+                     "accepted": "the server agreed to the weak proposal, no signed reply",
                      "refused": "disconnect or reset", "inconclusive": "no answer either way"},
+        "counts_note": "agreed counts completed and accepted probes together",
         "hosts": hosts_json}));
 }
 
@@ -2721,7 +2737,8 @@ fn main() {
             doc["endpoints"] = json!(recs.iter().map(|r| json!({"host": r.host, "port": r.port, "group": r.value,
                 "category": r.category, "post_quantum": r.category == "pq-ready"})).collect::<Vec<_>>());
             doc["appended"] = json!(merged.len() > recs.len());
-            doc["files"] = json!({"inventory": format!("{outdir}/inventory.json"), "cbom": format!("{outdir}/cbom.json")});
+            doc["files"] = json!({"inventory": format!("{outdir}/inventory.json"), "cbom": format!("{outdir}/cbom.json"),
+                                  "report": format!("{outdir}/report.html"), "sarif": format!("{outdir}/cryptocensus.sarif")});
             emit_json(&doc);
             for r in &recs {
                 let verdict = if r.category == "pq-ready" { paint("POST-QUANTUM", "92") } else { paint("classical, quantum-vulnerable", "93") };

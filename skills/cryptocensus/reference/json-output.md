@@ -2,20 +2,20 @@
 
 Pass `--json` to `scan`, `tls`, `downgrade`, `fix` or `diff`. stdout then carries exactly
 one JSON document; the human view goes to stderr without colour. The examples below are
-real runs against a lab server, shortened with "... N more".
+real runs against two lab servers on 127.0.0.1 (a weak one on 2224, a post-quantum one on
+2223 and 4443), shortened with "... N more".
 
 A grade is always an object `{"grade": "A".."F", "score": 0..100}`.
 Categories are `broken`, `legacy-classical`, `quantum-vulnerable` and `pq-ready`.
+Ports are numbers here; `inventory.json` on disk stores them as strings.
 
 ## Errors
 
-Exit code 2 with one document:
+Exit code 2 with one document. Nothing answering is never graded and never passes a gate.
 
 ```json
 {"command": "scan", "error": "no SSH service answered; nothing graded, previous results kept", "exit": 2}
 ```
-
-Nothing answering is never graded and never passes a gate.
 
 ## scan
 
@@ -30,10 +30,10 @@ failed gate also exits 1).
 {
   "command": "scan",
   "files": {
-    "cbom": "before/cbom.json",
-    "inventory": "before/inventory.json",
-    "report": "before/report.html",
-    "sarif": "before/cryptocensus.sarif"
+    "cbom": "RUN/cbom.json",
+    "inventory": "RUN/inventory.json",
+    "report": "RUN/report.html",
+    "sarif": "RUN/cryptocensus.sarif"
   },
   "gate": {
     "pass": false,
@@ -87,10 +87,10 @@ failed gate also exits 1).
 
 ## tls
 
-The same fields as `scan` for the inventory now in `--out` (with `--append` this is
-SSH and TLS together), plus `endpoints[]`: `host`, `port`, `group` (the TLS 1.3 key
-share group the server chose), `category` and `post_quantum`. `appended` is true when
-the result was merged into an existing inventory.
+The same fields as `scan` for the inventory now in `--out`, plus `endpoints[]` (`host`,
+`port`, `group` is the TLS 1.3 key share group the server chose, `category`,
+`post_quantum`) and `appended`. With `--append` the inventory holds SSH and TLS
+together, as in this example (SSH on 2223 and TLS on 4443, 10 parameters, one CBOM).
 
 ```json
 {
@@ -98,86 +98,80 @@ the result was merged into an existing inventory.
   "command": "tls",
   "endpoints": [
     {
-      "category": "quantum-vulnerable",
-      "group": "x25519",
+      "category": "pq-ready",
+      "group": "X25519MLKEM768",
       "host": "127.0.0.1",
-      "port": 4444,
-      "post_quantum": false
+      "port": 4443,
+      "post_quantum": true
     }
   ],
   "files": {
-    "cbom": "RUN/cbom.json",
-    "inventory": "RUN/inventory.json"
+    "cbom": "PQ/cbom.json",
+    "inventory": "PQ/inventory.json",
+    "report": "PQ/report.html",
+    "sarif": "PQ/cryptocensus.sarif"
   },
   "hosts": [
     {
       "counts": {
-        "broken": 3,
-        "legacy-classical": 2,
-        "pq-ready": 1,
-        "quantum-vulnerable": 7
+        "broken": 0,
+        "legacy-classical": 0,
+        "pq-ready": 10,
+        "quantum-vulnerable": 0
       },
-      "findings": [
-        {
-          "category": "quantum-vulnerable",
-          "ctype": "kex",
-          "port": 2224,
-          "service": "ssh",
-          "source": "NIST IR 8547",
-          "value": "curve25519-sha256"
-        },
-        {
-          "category": "quantum-vulnerable",
-          "ctype": "kex",
-          "port": 2224,
-          "service": "ssh",
-          "source": "NIST IR 8547",
-          "value": "diffie-hellman-group14-sha256"
-        },
-        "... 10 more"
-      ],
+      "findings": [],
       "host": "127.0.0.1",
       "ports": [
-        2224,
-        4444
+        2223,
+        4443
       ],
       "verdict": {
-        "grade": "F",
-        "score": 32
+        "grade": "A",
+        "score": 100
       }
     }
   ],
   "overall": {
-    "grade": "F",
-    "score": 32
+    "grade": "A",
+    "score": 100
   },
-  "parameters": 13,
-  "port": 4444
+  "parameters": 10,
+  "port": 4443
 }
 ```
 
 ## downgrade
 
-`hosts[]`: `host`, `answered`, `probes[]` (`ctype`, `weak`, `category`, the `kex`,
-`cipher` and `mac` actually proposed, and the `verdict`), and the counts `accepted`,
-`completed`, `inconclusive` and `not_probed`. A host that lists nothing weak has
-`weak_only_proposal` (the verdict for a DH-group1 + 3DES + MD5 proposal) and empty
-`probes`. Verdicts: `completed` (accepted, and the server's key exchange reply came
-back with a valid structure and a host key signature), `accepted` (agreed, no signed
-reply), `refused` (disconnect or reset), `inconclusive`, and `not built` (no probe
-possible, for example a MAC test without a non-AEAD cipher).
+`hosts[]`: `host`, `answered`, `probes[]` and `counts`. Each probe has `ctype`, `weak`,
+`category`, the `kex`, `cipher` and `mac` actually proposed, and a `verdict`.
+`counts` has `agreed` (completed plus accepted), `completed`, `refused`,
+`inconclusive` and `not_probed` (over the cap of 32).
+
+Verdicts:
+- `completed`: the server agreed, and its key exchange reply came back with a valid
+  structure and a host key signature.
+- `accepted`: the server agreed, no signed reply.
+- `refused`: disconnect or reset.
+- `inconclusive`: no answer either way.
+- `not built`: no probe was possible.
+
+The weak server:
 
 ```json
 {
   "command": "downgrade",
+  "counts_note": "agreed counts completed and accepted probes together",
   "hosts": [
     {
-      "accepted": 5,
       "answered": true,
-      "completed": 5,
+      "counts": {
+        "agreed": 5,
+        "completed": 5,
+        "inconclusive": 0,
+        "not_probed": 0,
+        "refused": 0
+      },
       "host": "127.0.0.1",
-      "inconclusive": 0,
-      "not_probed": 0,
       "probes": [
         {
           "category": "broken",
@@ -204,7 +198,40 @@ possible, for example a MAC test without a non-AEAD cipher).
   "port": 2224,
   "verdicts": {
     "accepted": "the server agreed to the weak proposal, no signed reply",
-    "completed": "accepted, and the server sent its signed key exchange reply",
+    "completed": "the server agreed to the weak proposal and sent its signed key exchange reply",
+    "inconclusive": "no answer either way",
+    "refused": "disconnect or reset"
+  }
+}
+```
+
+A host that lists nothing weak has empty `probes` and a `weak_only_proposal` verdict.
+That verdict is the server's answer to DH-group1 + 3DES + MD5:
+
+```json
+{
+  "command": "downgrade",
+  "counts_note": "agreed counts completed and accepted probes together",
+  "hosts": [
+    {
+      "answered": true,
+      "counts": {
+        "agreed": 0,
+        "completed": 0,
+        "inconclusive": 0,
+        "not_probed": 0,
+        "refused": 0
+      },
+      "host": "127.0.0.1",
+      "note": "the server lists no broken or legacy kex, cipher or MAC",
+      "probes": [],
+      "weak_only_proposal": "refused"
+    }
+  ],
+  "port": 2223,
+  "verdicts": {
+    "accepted": "the server agreed to the weak proposal, no signed reply",
+    "completed": "the server agreed to the weak proposal and sent its signed key exchange reply",
     "inconclusive": "no answer either way",
     "refused": "disconnect or reset"
   }
@@ -214,8 +241,11 @@ possible, for example a MAC test without a non-AEAD cipher).
 ## fix
 
 `hosts[]`: `host`, `current` and `predicted` grades, `drop` (what the generated config
-removes), `kept` (weak but kept on purpose, for example the ed25519 host key) and
-`file` (the sshd drop-in it wrote). Nothing is installed: that is the user's decision.
+removes), `kept` (weak but kept on purpose, for example the ed25519 host key), `file`
+(the sshd drop-in it wrote), `side_effects` (tell the user before they approve),
+`install` (sshd keeps the first value it reads, so the file must come first) and `next`
+(the post-install proof with the right port). Nothing
+is installed: that is the user's decision.
 
 ```json
 {
@@ -239,8 +269,9 @@ removes), `kept` (weak but kept on purpose, for example the ed25519 host key) an
         },
         "... 8 more"
       ],
-      "file": "fix/fix/127.0.0.1_99-cryptocensus.conf",
+      "file": "RUN/fix/127.0.0.1_00-cryptocensus.conf",
       "host": "127.0.0.1",
+      "install": "sshd keeps the first value it reads: the file must be included before any other KexAlgorithms, Ciphers, MACs or HostKeyAlgorithms line; check with sshd -T | grep -iE '^(kexalgorithms|ciphers|macs|hostkeyalgorithms)' before reloading",
       "kept": [
         {
           "category": "quantum-vulnerable",
@@ -251,20 +282,30 @@ removes), `kept` (weak but kept on purpose, for example the ed25519 host key) an
       "predicted": {
         "grade": "A",
         "score": 93
-      }
+      },
+      "side_effects": [
+        "clients need sntrup761 (OpenSSH 8.5+) or ML-KEM (OpenSSH 9.9+) key exchange; older clients cannot connect",
+        "only the ssh-ed25519 host key is offered; a client that accepts only RSA or ECDSA host keys cannot connect",
+        "... 1 more"
+      ]
     }
   ],
-  "next": "review the drop-in, install it with sshd -t, re-scan, then cryptocensus diff before/inventory.json after/inventory.json --fail-on-regression",
+  "next": "after approval: install the drop-in first in the config, sshd -t, reload, then cryptocensus scan --targets <host> --port 2224 --out <new dir> and cryptocensus diff <old dir>/inventory.json <new dir>/inventory.json --fail-on-regression",
   "port": 2224
 }
 ```
 
 ## diff
 
-`improvements` and `regressions` (adding a non-pq-ready algorithm, losing the last
-pq-ready algorithm of a kind, a falling score or a vanished host is a regression),
-`added[]`, `removed[]`, `hosts[]` with `before` and `after` grades (null when the host
-is missing on one side), and `gate` (`--fail-on-regression` exits 1 when it fails).
+`improvements` and `regressions`. A regression is any of these:
+- a non-pq-ready algorithm was added;
+- the last pq-ready algorithm of a kind was lost;
+- a score fell;
+- a host vanished.
+
+Also `added[]`, `removed[]`, `hosts[]` with `before` and `after` grades (null when the
+host is missing on one side), and `gate`. With `--fail-on-regression`, a failed gate
+exits 1. This example is before and after installing the fix:
 
 ```json
 {
@@ -273,40 +314,40 @@ is missing on one side), and `gate` (`--fail-on-regression` exits 1 when it fail
       "category": "pq-ready",
       "ctype": "cipher",
       "host": "127.0.0.1",
-      "port": 2223,
+      "port": 2224,
       "value": "aes256-ctr"
     },
     {
       "category": "pq-ready",
       "ctype": "cipher",
       "host": "127.0.0.1",
-      "port": 2223,
+      "port": 2224,
       "value": "aes256-gcm@openssh.com"
     },
-    "... 7 more"
+    "... 6 more"
   ],
-  "after": "after/inventory.json",
-  "before": "before/inventory.json",
+  "after": "RUN2/inventory.json",
+  "before": "RUN/inventory.json",
   "command": "diff",
   "gate": {
     "fail_on_regression": true,
-    "pass": false
+    "pass": true
   },
   "hosts": [
     {
       "after": {
         "grade": "A",
-        "score": 100
+        "score": 93
       },
       "before": {
         "grade": "F",
-        "score": 37
+        "score": 32
       },
       "host": "127.0.0.1"
     }
   ],
-  "improvements": 21,
-  "regressions": 2,
+  "improvements": 19,
+  "regressions": 0,
   "removed": [
     {
       "category": "broken",
@@ -322,7 +363,7 @@ is missing on one side), and `gate` (`--fail-on-regression` exits 1 when it fail
       "port": 2224,
       "value": "aes128-cbc"
     },
-    "... 11 more"
+    "... 9 more"
   ]
 }
 ```
