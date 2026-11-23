@@ -7,13 +7,14 @@
       {"match": ["sntrup761x25519", "mlkem768x25519", "mlkem1024", "mlkem768", "ml-kem", "kyber"], "category": "pq-ready", "why": "Hybrid or pure lattice KEM (NIST FIPS 203 ML-KEM), resists Shor", "source": "NIST FIPS 203"},
       {"match": ["diffie-hellman-group1-sha1"], "category": "broken", "why": "1024-bit MODP group plus SHA-1, below NIST minimum and quantum-vulnerable", "source": "NIST SP 800-131A"},
       {"match": ["diffie-hellman-group-exchange-sha1", "diffie-hellman-group14-sha1", "gss-group1-sha1", "rsa1024-sha1"], "category": "legacy-classical", "why": "SHA-1 based or small classical DH, deprecated", "source": "NIST SP 800-131A"},
-      {"match": ["curve25519-sha256", "ecdh-sha2", "diffie-hellman-group14-sha256", "diffie-hellman-group16-sha512", "diffie-hellman-group18-sha512", "diffie-hellman-group-exchange-sha256"], "category": "quantum-vulnerable", "why": "Strong classical ECDH or DH, broken by Shor on a large quantum computer", "source": "NIST IR 8547"}
+      {"match": ["curve25519-sha256", "curve448-sha512", "ecdh-sha2", "diffie-hellman-group14-sha256", "diffie-hellman-group15-sha512", "diffie-hellman-group16-sha512", "diffie-hellman-group17-sha512", "diffie-hellman-group18-sha512", "diffie-hellman-group-exchange-sha256"], "category": "quantum-vulnerable", "why": "Strong classical ECDH or DH, broken by Shor on a large quantum computer", "source": "NIST IR 8547"}
     ],
     "hostkey": [
+      {"match": ["ssh-mldsa", "mldsa", "ml-dsa", "slh-dsa", "sphincs"], "category": "pq-ready", "why": "Post-quantum signature (NIST FIPS 204/205), checked first so a hybrid name that also contains a classical algorithm is not misread", "source": "NIST FIPS 204/205"},
       {"match": ["ssh-dss"], "category": "broken", "why": "DSA (ssh-dss) is disabled in modern OpenSSH", "source": "OpenSSH 7.0 release notes, NIST SP 800-131A"},
+      {"match": ["rsa-sha2-256", "rsa-sha2-512", "ssh-rsa-sha256@ssh.com", "ssh-rsa-sha512@ssh.com", "x509v3-rsa2048-sha256"], "category": "quantum-vulnerable", "why": "RSA with a SHA-2 signature, strong today, broken by Shor", "source": "NIST IR 8547"},
       {"match": ["ssh-rsa"], "category": "legacy-classical", "why": "RSA with SHA-1 signature (ssh-rsa), deprecated by OpenSSH", "source": "OpenSSH 8.8 release notes"},
-      {"match": ["rsa-sha2-256", "rsa-sha2-512", "ssh-ed25519", "sk-ssh-ed25519", "ecdsa-sha2", "ecdsa"], "category": "quantum-vulnerable", "why": "Strong classical RSA/ECDSA/EdDSA signature, broken by Shor", "source": "NIST IR 8547"},
-      {"match": ["ssh-mldsa", "ml-dsa", "slh-dsa", "sphincs"], "category": "pq-ready", "why": "Post-quantum signature (NIST FIPS 204/205)", "source": "NIST FIPS 204/205"}
+      {"match": ["ssh-ed25519", "sk-ssh-ed25519", "ssh-ed448", "ecdsa-sha2", "ecdsa"], "category": "quantum-vulnerable", "why": "Strong classical ECDSA/EdDSA signature, broken by Shor", "source": "NIST IR 8547"}
     ],
     "cipher": [
       {"match": ["arcfour", "rc4", "des-cbc", "3des", "blowfish", "cast128", "none", "null", "export"], "category": "broken", "why": "RC4/DES/3DES/Blowfish and null/export ciphers are broken or far below strength", "source": "RFC 7465, NIST SP 800-131A"},
