@@ -31,7 +31,7 @@
           "sntrup761x25519"
         ],
         "category": "pq-ready",
-        "why": "Hybrid Streamlined NTRU Prime with X25519, the OpenSSH default since 9.0; resists Shor but is not NIST-standardised",
+        "why": "Hybrid Streamlined NTRU Prime with X25519, OpenSSH's default from 9.0 until 10.0 switched to ML-KEM; resists Shor but is not NIST-standardised",
         "source": "OpenSSH 9.0 release notes, IETF draft-josefsson-ntruprime-ssh"
       },
       {
@@ -196,8 +196,8 @@
           "umac-64"
         ],
         "category": "legacy-classical",
-        "why": "SHA-1, RIPEMD-160 and 64-bit-tag UMAC MACs are phased out of modern SSH defaults",
-        "source": "Project rule following OpenSSH defaults; NIST SP 800-131A still allows HMAC-SHA-1"
+        "why": "SHA-1, RIPEMD-160 and 64-bit-tag UMAC MACs: not broken, but weak hashing or short tags, phase out",
+        "source": "Project rule in line with ssh-audit warnings; NIST SP 800-131A still allows HMAC-SHA-1"
       },
       {
         "match": [

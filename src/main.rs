@@ -879,10 +879,12 @@ fn robustness_selftest(policy: &Value) {
     // downgrade probes: one per weak algorithm, other slots from the server's strong choices
     let offer: Vec<(String, String)> = [("kex", "curve25519-sha256"), ("kex", "diffie-hellman-group1-sha1"), ("hostkey", "ssh-ed25519"),
         ("cipher", "aes256-gcm@openssh.com"), ("cipher", "3des-cbc"), ("cipher", "aes128-cbc"), ("cipher", "aes128-ctr"),
-        ("mac", "hmac-sha2-256"), ("mac", "hmac-md5")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-    let pr = build_probes(&offer);
+        ("mac", "hmac-sha2-256"), ("mac", "hmac-md5"), ("mac", "hmac-sha1")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+    let pr = build_probes(&offer, policy);
     let names: Vec<&str> = pr.iter().map(|p| p.weak.as_str()).collect();
-    assert_eq!(names, vec!["diffie-hellman-group1-sha1", "3des-cbc", "aes128-cbc", "hmac-md5"], "one probe per weak algorithm");
+    assert_eq!(names, vec!["diffie-hellman-group1-sha1", "3des-cbc", "aes128-cbc", "hmac-md5", "hmac-sha1"],
+               "one probe per broken or legacy algorithm, taken from the policy bands");
+    assert_eq!(pr[0].mac.as_deref(), Some("hmac-sha2-256"), "the other slots never use a weak MAC");
     assert_eq!(pr[0].cipher.as_deref(), Some("aes256-gcm@openssh.com"), "the kex probe uses a strong cipher");
     assert_eq!(pr[1].kex.as_deref(), Some("curve25519-sha256"), "the cipher probe uses a strong kex");
     assert_eq!(pr[3].cipher.as_deref(), Some("aes128-ctr"), "the MAC probe uses a strong non-AEAD cipher");
@@ -956,7 +958,7 @@ fn bench(targets: &str, port: u16, timeout: Duration, workers: usize, run_nmap: 
 
 // ================= post-verdict lifecycle features =================
 // The scanner labels risk. These turn the verdict into action: remediate (fix),
-// verify and monitor (diff), see crypto at rest (local), gate CI (SARIF +
+// verify and monitor (diff), see the host configuration (local), gate CI (SARIF +
 // --fail-under), and prove exploitability (active downgrade test).
 
 fn readiness_cat(cats: &[String]) -> f64 {
@@ -1028,6 +1030,10 @@ fn hardened_conf(host: &str, file: &str) -> String {
 # Needs OpenSSH 9.9 or newer (mlkem768x25519-sha256); `sshd -t` rejects it on older versions.
 # Install:  sudo cp {file} /etc/ssh/sshd_config.d/99-cryptocensus.conf  &&  sudo sshd -t  &&  sudo systemctl reload ssh
 # Verify:   cryptocensus scan --targets {host} --out after  &&  cryptocensus diff before/inventory.json after/inventory.json
+# Host key: ssh-ed25519 stays so every client can connect. OpenSSH 10.4 added the post-quantum
+#   ssh-mldsa44-ed25519 as an opt-in and 10.6 enables it by default. When your clients are there:
+#   ssh-keygen -t mldsa44-ed25519 -f /etc/ssh/ssh_host_mldsa44_ed25519_key, add it as a HostKey
+#   and list it first in HostKeyAlgorithms.
 KexAlgorithms {HARDENED_KEX}
 Ciphers {HARDENED_CIPHERS}
 MACs {HARDENED_MACS}
@@ -1072,7 +1078,7 @@ fn fix_cmd(targets: &str, port: u16, timeout: Duration, workers: usize, policy: 
         if drop.len() > 10 { println!("      {} and {} more", dim("..."), drop.len() - 10); }
         for k in &kept_weak {
             println!("      {} {:8} {} {}", dim("="), k.ctype, paint(&k.value, cat_fg(&k.category)),
-                     dim("kept: a post-quantum host key (ssh-mldsa44-ed25519) needs OpenSSH 10.5+ on both sides"));
+                     dim("kept: clients accept the post-quantum ssh-mldsa44-ed25519 by default only from OpenSSH 10.6"));
         }
         println!("    {} {} {:.0}/100 after applying {}", paint("=>", "92"),
                  paint(&format!(" {pred_g} "), cat_bg_for_grade(pred_g)), pred_s, dim(&path));
@@ -1191,7 +1197,7 @@ fn diff_cmd(old_path: &str, new_path: &str, fail_on_regression: bool) {
     }
 }
 
-// ----- Feature 3: crypto at rest on this host (closes the "network only" limitation) -----
+// ----- Feature 3: the host configuration and the ssh client (closes the "network only" limitation) -----
 fn openssl_pq(ver: &str) -> (String, String) {
     let nums: Vec<u32> = ver.split_whitespace().nth(1).unwrap_or("")
         .split('.').take(2).filter_map(|s| s.parse().ok()).collect();
@@ -1201,7 +1207,7 @@ fn openssl_pq(ver: &str) -> (String, String) {
 }
 fn local_cmd(policy: &Value, outdir: &str) {
     banner();
-    eprintln!("  {} local crypto at rest: effective sshd algorithms, host keys, openssl", bold("inspecting"));
+    eprintln!("  {} local host configuration: effective sshd algorithms, host keys, openssl, ssh client preference", bold("inspecting"));
     let host = "localhost";
     let mut recs: Vec<Record> = Vec::new();
     match Command::new("sshd").arg("-T").output() {
@@ -1247,35 +1253,45 @@ fn local_cmd(policy: &Value, outdir: &str) {
     let dir = format!("{outdir}/local");
     write_outputs(&recs, &dir, &stamp);
     print_summary(&recs, &BTreeMap::new());
+    client_kex_check(policy);
     println!("  {} {dir}/inventory.json | {dir}/cbom.json | {dir}/report.html | {dir}/cryptocensus.sarif", dim("written:"));
+}
+// SSH negotiation takes the CLIENT's first key exchange that the server also offers, so a
+// classical first choice wins against every server that still lists it. macOS ships
+// /etc/ssh/crypto.conf with "KexAlgorithms ^ecdh-sha2-nistp256", which does exactly that.
+fn client_kex_check(policy: &Value) {
+    let Ok(out) = Command::new("ssh").args(["-G", "127.0.0.1"]).output() else { return };
+    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    let Some(first) = text.lines().find_map(|l| l.strip_prefix("kexalgorithms ")).and_then(|v| v.split(',').next()) else { return };
+    let (cat, _, _) = score(policy, "kex", first);
+    if cat == "pq-ready" {
+        println!("  {} the ssh client on this machine prefers {first} first", paint("client", "92"));
+    } else {
+        println!("  {} the ssh client on this machine prefers {} [{}] first,", paint("client", "93"), bold(first), paint(&cat, cat_fg(&cat)));
+        println!("         so every server that still offers it gets a classical session");
+    }
 }
 
 // ----- Feature 5: active downgrade test. Does the server actually accept weak crypto? -----
-const WEAK_KEX: [&str; 4] = ["diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1", "diffie-hellman-group-exchange-sha1", "gss-"];
-const WEAK_CIPHERS: [&str; 6] = ["3des-cbc", "arcfour", "arcfour128", "arcfour256", "blowfish-cbc", "aes128-cbc"];
-const WEAK_MACS: [&str; 3] = ["hmac-md5", "hmac-md5-96", "hmac-sha1-96"];
-
-fn is_weak_name(v: &str, weak: &[&str]) -> bool { let l = v.to_lowercase(); weak.iter().any(|w| l.contains(&w.to_lowercase())) }
-fn weak_list(ctype: &str) -> &'static [&'static str] {
-    match ctype { "kex" => &WEAK_KEX[..], "cipher" => &WEAK_CIPHERS[..], _ => &WEAK_MACS[..] }
-}
 #[derive(Debug, PartialEq)]
 struct Probe { ctype: &'static str, weak: String, kex: Option<String>, cipher: Option<String>, mac: Option<String> }
-// One probe for EVERY weak algorithm the server lists. The weak name goes alone in its slot;
-// the other slots take the server's own strong choices, so a probe can only fail on the
-// algorithm under test. A MAC is only negotiated with a non-AEAD cipher.
-fn build_probes(found: &[(String, String)]) -> Vec<Probe> {
+// One probe for EVERY weak key exchange, cipher and MAC the server lists, where weak means the
+// policy's broken or legacy-classical band (the red and orange rows of the scan). The weak name
+// goes alone in its slot; the other slots take the server's own first non-weak choice, so a
+// probe can only fail on the algorithm under test. A MAC is only negotiated with a non-AEAD cipher.
+fn build_probes(found: &[(String, String)], policy: &Value) -> Vec<Probe> {
+    let weak = |t: &str, v: &str| { let c = score(policy, t, v).0; c == "broken" || c == "legacy-classical" };
     let pick = |t: &str, no_aead: bool| -> Option<String> {
         let ok = |v: &String| !(no_aead && (v.contains("gcm") || v.contains("poly1305")));
         let slot: Vec<&String> = found.iter().filter(|(c, _)| c == t).map(|(_, v)| v).filter(|v| ok(v)).collect();
-        slot.iter().find(|v| !is_weak_name(v, weak_list(t))).or(slot.first()).map(|v| v.to_string())
+        slot.iter().find(|v| !weak(t, v)).or(slot.first()).map(|v| v.to_string())
     };
     let (pk, pc, pm, pc_mac) = (pick("kex", false), pick("cipher", false), pick("mac", false), pick("cipher", true));
     let mut probes = Vec::new();
     let mut seen = BTreeSet::new();
     for ctype in ["kex", "cipher", "mac"] {
         for (c, v) in found.iter().filter(|(c, _)| c == ctype) {
-            if !is_weak_name(v, weak_list(c)) || !seen.insert(v.clone()) { continue; }
+            if !weak(c, v) || !seen.insert(v.clone()) { continue; }
             let w = Some(v.clone());
             probes.push(match ctype {
                 "kex" => Probe { ctype: "kex", weak: v.clone(), kex: w, cipher: pc.clone(), mac: pm.clone() },
@@ -1377,7 +1393,7 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
         let hostkeys: Vec<String> = found.iter().filter(|(ct, _)| ct == "hostkey").map(|(_, v)| v.clone()).collect();
         let hk = if hostkeys.is_empty() { "ssh-ed25519,rsa-sha2-256,ssh-rsa".to_string() } else { hostkeys.join(",") };
         println!("\n  {} {}", bold("host"), bold(&ip.to_string()));
-        let probes = build_probes(&found);
+        let probes = build_probes(&found, policy);
         if probes.is_empty() {
             println!("    {} no weak kex/cipher/mac in the offer", paint("ok", "92"));
             match live_downgrade(*ip, port, "diffie-hellman-group1-sha1", &hk, "3des-cbc", "hmac-md5", timeout) {
@@ -1657,7 +1673,8 @@ fn is_probable_prime(n: &BigUint, small: &[u64], rng: &mut Xorshift) -> bool {
     true
 }
 fn gen_prime(rng: &mut Xorshift, bits: u64, small: &[u64]) -> BigUint {
-    loop { let c = rand_biguint(rng, bits); if is_probable_prime(&c, small, rng) { return c; } }
+    // the two top bits set, as real RSA key generation does, so p*q has exactly 2*bits bits
+    loop { let c = rand_biguint(rng, bits) | (BigUint::one() << (bits - 2)); if is_probable_prime(&c, small, rng) { return c; } }
 }
 fn batch_gcd(moduli: &[BigUint]) -> Vec<BigUint> {
     // product tree: each level is the pairwise products of the level below
@@ -1699,8 +1716,8 @@ fn batchgcd_run(keys: usize, bits: u64) {
     banner();
     let small = small_primes(2000);
     let mut rng = Xorshift(0x9E3779B97F4A7C15);
-    let size_note = if 2 * bits < 2048 { " (toy size so it runs live; the method is the same at RSA-2048)" } else { "" };
-    println!("  {} building a corpus of {keys} RSA-{} keys with a planted shared prime{size_note}", bold("[*]"), 2 * bits);
+    let size_note = if 2 * bits < 2048 { " (toy size for a live demo)" } else { "" };
+    println!("  {} corpus: {keys} RSA-{} keys, one shared prime planted{size_note}", bold("[*]"), 2 * bits);
     let planted = gen_prime(&mut rng, bits, &small);
     let mut moduli: Vec<BigUint> = Vec::with_capacity(keys + 2);
     let mut labels: Vec<String> = Vec::with_capacity(keys + 2);
@@ -1727,8 +1744,8 @@ fn batchgcd_run(keys: usize, bits: u64) {
             let challenge = BigUint::from_bytes_be(b"authenticate-as-this-host") % &moduli[i];
             let sig = challenge.modpow(&d, &moduli[i]);
             let ok = sig.modpow(&e, &moduli[i]) == challenge;
-            println!("    {} {}: recovered a {}-bit shared prime, rebuilt the {}-bit private key, forged signature verifies: {}",
-                     paint("+", "92"), labels[i], p.bits(), d.bits(),
+            println!("    {} {}: shared {}-bit prime, {}-bit private key rebuilt, forged signature verifies: {}",
+                     paint("+", "92"), labels[i], p.bits(), moduli[i].bits(),
                      if ok { paint("true", "92") } else { paint("false", "91") });
         }
     }
@@ -2042,6 +2059,7 @@ fn build_findings_digest(recs: &[Record]) -> (String, &'static str, f64) {
     let os = readiness(&all);
     let (og, _) = grade(os);
     let mut d = format!("Overall: grade {og} ({os:.0}/100) across {} host(s) and {} parameter(s).\n", by_host.len(), recs.len());
+    d.push_str("Bands: broken = unsafe today; legacy-classical = deprecated, phase out; quantum-vulnerable = safe today, breakable by a future quantum computer; pq-ready = believed quantum-safe.\n");
     if let Some((w, ws)) = worst_host(recs) {
         d.push_str(&format!("Worst host: {} with grade {} ({ws:.0}/100).\n", clean(&w), grade(ws).0));
     }
@@ -2056,7 +2074,9 @@ fn build_findings_digest(recs: &[Record]) -> (String, &'static str, f64) {
         let mut weak: Vec<&&Record> = rs.iter().filter(|r| r.category != "pq-ready").collect();
         weak.sort_by(|a, b| severity(&b.category).cmp(&severity(&a.category)));
         for r in weak.iter().take(8) {
-            d.push_str(&format!("  - {} {} [{}] {}\n", clean(&r.ctype), clean(&r.value), clean(&r.category), clean(&r.why)));
+            // only the algorithm names: the per-rule rationale lists families (RC4, null, export)
+            // a host may not have, and a small model repeats them as findings
+            d.push_str(&format!("  - {} {} [{}]\n", clean(&r.ctype), clean(&r.value), clean(&r.category)));
         }
     }
     (d, og, os)
@@ -2104,7 +2124,7 @@ fn remediation_plan(recs: &[Record]) -> String {
         "kex" => "mlkem768x25519-sha256 or sntrup761x25519-sha512",
         "cipher" => "aes256-gcm or chacha20-poly1305",
         "mac" => "hmac-sha2-256-etm or hmac-sha2-512-etm",
-        "hostkey" => "ssh-mldsa44-ed25519 where both sides run OpenSSH 10.5+, otherwise ssh-ed25519",
+        "hostkey" => "ssh-mldsa44-ed25519 once clients run OpenSSH 10.6+, until then ssh-ed25519",
         "tls_group" => "X25519MLKEM768",
         _ => "a post-quantum ready equivalent",
     };
@@ -2251,7 +2271,7 @@ fn usage() -> ! {
          cryptocensus tls       --targets <IPs|CIDR> --port 4443\n  \
          cryptocensus fix       --targets <IPs|CIDR> [--port 22] [--out ./results]     post-quantum sshd hardening + the grade it reaches\n  \
          cryptocensus diff      <before.json> <after.json> [--fail-on-regression]      drift between two scans\n  \
-         cryptocensus local     [--out ./results]                                      crypto at rest on this host (sshd, host keys, openssl)\n  \
+         cryptocensus local     [--out ./results]                                      host configuration (sshd, host keys, openssl)\n  \
          cryptocensus downgrade --targets <IPs|CIDR> [--port 22]                       active test: does the server accept weak crypto\n  \
          cryptocensus shor      [--factor N | --rsa-demo --rsa-n N | --resource BITS]   Shor's algorithm: factor an RSA key, rebuild the private key\n  \
          cryptocensus batchgcd  [--keys N] [--bits B]                                  shared-prime key recovery across a key corpus (Mining your Ps and Qs)\n  \
