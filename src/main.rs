@@ -2029,7 +2029,10 @@ fn ai_report_cmd(outdir: &str, use_ai: bool) {
     let path = format!("{outdir}/executive_brief.md");
     write_file(&path, &out);
     println!("\n{out}");
-    println!("  {} {path}", dim("written:"));
+    // the colour-coded heatmap, rebuilt from the same inventory the brief used
+    let heat = format!("{outdir}/heatmap.html");
+    write_file(&heat, &build_html(&recs, &now_iso()));
+    println!("  {} {path} | {heat}", dim("written:"));
 }
 
 fn ai_ask_cmd(question: &str, outdir: &str) {

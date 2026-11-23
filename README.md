@@ -45,7 +45,7 @@ cryptocensus downgrade --targets <IPs|CIDR>        active test: does the server 
 cryptocensus shor      [--factor N | --rsa-demo --rsa-n N | --resource BITS]
 cryptocensus batchgcd  [--keys N] [--bits B]       shared-prime key recovery (Mining your Ps and Qs)
 cryptocensus roadmap   [--out ./results]           dated PQ migration plan (Mosca, knapsack, topo sort)
-cryptocensus report    [--ai] [--out ./results]    executive brief from the findings
+cryptocensus report    [--ai] [--out ./results]    executive brief and heatmap from an inventory
 cryptocensus ask       "<question>" [--out ./results]
 cryptocensus bench     --targets <IPs|CIDR> [--nmap]
 cryptocensus selftest
@@ -54,13 +54,23 @@ cryptocensus selftest
 Each scan writes `inventory.json`, a CycloneDX 1.6 `cbom.json`, an HTML heatmap
 `report.html`, and a SARIF 2.1.0 file for CI.
 
+Exit codes: `0` success, `1` a gate failed (`--fail-under`, `--fail-on-regression`),
+`2` an error, including a scan where no host answered. A scan that sees nothing is
+never graded: it exits 2 and keeps the previous results.
+
+`downgrade` sends one probe per weak algorithm the server offers, with every other
+slot taken from the server's own offer, so a server that accepts a single weak
+algorithm is caught. A reset or silence is never counted as acceptance.
+
 ## The AI layer
 
 `report --ai` and `ask` use a local model (llama3.2:3b via Ollama on
-127.0.0.1) to turn the computed findings into prose. The model only writes text:
-every grade, count and CBOM entry is computed by the deterministic engine and the
-model never changes a verdict. If the model is not running, `report` falls back to
-a deterministic template, so it never fails. Nothing leaves the host.
+127.0.0.1). The model only writes the summary paragraph: the grade, every count,
+the CBOM and the remediation plan are computed by the engine. The summary is checked
+against the engine at runtime (it must name the same worst host) and is rejected
+otherwise, with one retry and then a deterministic template. The same template is
+used if the model is not running, so the command never fails. Nothing leaves the
+host.
 
 ```
 ollama serve &
@@ -69,6 +79,13 @@ cryptocensus scan --targets 127.0.0.1 --out results
 cryptocensus report --ai --out results
 cryptocensus ask "which host is the worst and what should I fix first?" --out results
 ```
+
+## Testing against OpenSSH 9.8 or newer
+
+OpenSSH 9.8+ penalises clients that connect repeatedly without logging in
+(`PerSourcePenalties`), which is what a scanner does. A test server you scan many
+times should set `PerSourcePenalties no`; otherwise it stops answering and the scan
+reports "no SSH service answered" (exit 2).
 
 ## Limitations
 
