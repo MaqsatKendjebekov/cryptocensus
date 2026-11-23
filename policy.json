@@ -1,45 +1,305 @@
 {
   "_about": "CryptoCensus scoring policy. Each rule maps a crypto primitive to a readiness category. Categories: broken (unsafe today), legacy-classical (deprecated, phase out), quantum-vulnerable (safe today but breakable by a large quantum computer via Shor), pq-ready (believed safe against quantum). Sources cited per rule group.",
-  "categories": ["broken", "legacy-classical", "quantum-vulnerable", "pq-ready"],
-  "severity": {"broken": 4, "legacy-classical": 3, "quantum-vulnerable": 2, "pq-ready": 1},
+  "categories": [
+    "broken",
+    "legacy-classical",
+    "quantum-vulnerable",
+    "pq-ready"
+  ],
+  "severity": {
+    "broken": 4,
+    "legacy-classical": 3,
+    "quantum-vulnerable": 2,
+    "pq-ready": 1
+  },
   "rules": {
     "kex": [
-      {"match": ["sntrup761x25519", "mlkem768x25519", "mlkem1024", "mlkem768", "ml-kem", "kyber"], "category": "pq-ready", "why": "Hybrid or pure lattice KEM (NIST FIPS 203 ML-KEM), resists Shor", "source": "NIST FIPS 203"},
-      {"match": ["diffie-hellman-group1-sha1"], "category": "broken", "why": "1024-bit MODP group plus SHA-1, below NIST minimum and quantum-vulnerable", "source": "NIST SP 800-131A"},
-      {"match": ["diffie-hellman-group-exchange-sha1", "diffie-hellman-group14-sha1", "gss-group1-sha1", "rsa1024-sha1"], "category": "legacy-classical", "why": "SHA-1 based or small classical DH, deprecated", "source": "NIST SP 800-131A"},
-      {"match": ["curve25519-sha256", "curve448-sha512", "ecdh-sha2", "diffie-hellman-group14-sha256", "diffie-hellman-group15-sha512", "diffie-hellman-group16-sha512", "diffie-hellman-group17-sha512", "diffie-hellman-group18-sha512", "diffie-hellman-group-exchange-sha256"], "category": "quantum-vulnerable", "why": "Strong classical ECDH or DH, broken by Shor on a large quantum computer", "source": "NIST IR 8547"}
+      {
+        "match": [
+          "mlkem768x25519",
+          "mlkem1024",
+          "mlkem768",
+          "ml-kem",
+          "kyber"
+        ],
+        "category": "pq-ready",
+        "why": "Hybrid or pure ML-KEM lattice key encapsulation, resists Shor",
+        "source": "NIST FIPS 203"
+      },
+      {
+        "match": [
+          "sntrup761x25519"
+        ],
+        "category": "pq-ready",
+        "why": "Hybrid Streamlined NTRU Prime with X25519, the OpenSSH default since 9.0; resists Shor but is not NIST-standardised",
+        "source": "OpenSSH 9.0 release notes, IETF draft-josefsson-ntruprime-ssh"
+      },
+      {
+        "match": [
+          "diffie-hellman-group1-sha1"
+        ],
+        "category": "broken",
+        "why": "1024-bit MODP group plus SHA-1, below NIST minimum and quantum-vulnerable",
+        "source": "NIST SP 800-131A"
+      },
+      {
+        "match": [
+          "diffie-hellman-group-exchange-sha1",
+          "diffie-hellman-group14-sha1",
+          "gss-group1-sha1",
+          "rsa1024-sha1"
+        ],
+        "category": "legacy-classical",
+        "why": "SHA-1 based or small classical DH, deprecated",
+        "source": "NIST SP 800-131A"
+      },
+      {
+        "match": [
+          "curve25519-sha256",
+          "curve448-sha512",
+          "ecdh-sha2",
+          "diffie-hellman-group14-sha256",
+          "diffie-hellman-group15-sha512",
+          "diffie-hellman-group16-sha512",
+          "diffie-hellman-group17-sha512",
+          "diffie-hellman-group18-sha512",
+          "diffie-hellman-group-exchange-sha256"
+        ],
+        "category": "quantum-vulnerable",
+        "why": "Strong classical ECDH or DH, broken by Shor on a large quantum computer",
+        "source": "NIST IR 8547"
+      }
     ],
     "hostkey": [
-      {"match": ["ssh-mldsa", "mldsa", "ml-dsa", "slh-dsa", "sphincs"], "category": "pq-ready", "why": "Post-quantum signature (NIST FIPS 204/205), checked first so a hybrid name that also contains a classical algorithm is not misread", "source": "NIST FIPS 204/205"},
-      {"match": ["ssh-dss"], "category": "broken", "why": "DSA (ssh-dss) is disabled in modern OpenSSH", "source": "OpenSSH 7.0 release notes, NIST SP 800-131A"},
-      {"match": ["rsa-sha2-256", "rsa-sha2-512", "ssh-rsa-sha256@ssh.com", "ssh-rsa-sha512@ssh.com", "x509v3-rsa2048-sha256"], "category": "quantum-vulnerable", "why": "RSA with a SHA-2 signature, strong today, broken by Shor", "source": "NIST IR 8547"},
-      {"match": ["ssh-rsa"], "category": "legacy-classical", "why": "RSA with SHA-1 signature (ssh-rsa), deprecated by OpenSSH", "source": "OpenSSH 8.8 release notes"},
-      {"match": ["ssh-ed25519", "sk-ssh-ed25519", "ssh-ed448", "ecdsa-sha2", "ecdsa"], "category": "quantum-vulnerable", "why": "Strong classical ECDSA/EdDSA signature, broken by Shor", "source": "NIST IR 8547"}
+      {
+        "match": [
+          "ssh-mldsa",
+          "mldsa",
+          "ml-dsa",
+          "slh-dsa",
+          "sphincs"
+        ],
+        "category": "pq-ready",
+        "why": "Post-quantum signature (NIST FIPS 204/205), checked first so a hybrid name that also contains a classical algorithm is not misread",
+        "source": "NIST FIPS 204/205"
+      },
+      {
+        "match": [
+          "ssh-dss"
+        ],
+        "category": "broken",
+        "why": "DSA (ssh-dss) is disabled in modern OpenSSH",
+        "source": "OpenSSH 7.0 release notes, NIST SP 800-131A"
+      },
+      {
+        "match": [
+          "rsa-sha2-256",
+          "rsa-sha2-512",
+          "ssh-rsa-sha256@ssh.com",
+          "ssh-rsa-sha512@ssh.com",
+          "x509v3-rsa2048-sha256"
+        ],
+        "category": "quantum-vulnerable",
+        "why": "RSA with a SHA-2 signature, strong today, broken by Shor",
+        "source": "NIST IR 8547"
+      },
+      {
+        "match": [
+          "ssh-rsa"
+        ],
+        "category": "legacy-classical",
+        "why": "RSA with SHA-1 signature (ssh-rsa), deprecated by OpenSSH",
+        "source": "OpenSSH 8.8 release notes"
+      },
+      {
+        "match": [
+          "ssh-ed25519",
+          "sk-ssh-ed25519",
+          "ssh-ed448",
+          "ecdsa-sha2",
+          "ecdsa"
+        ],
+        "category": "quantum-vulnerable",
+        "why": "Strong classical ECDSA/EdDSA signature, broken by Shor",
+        "source": "NIST IR 8547"
+      }
     ],
     "cipher": [
-      {"match": ["arcfour", "rc4", "des-cbc", "3des", "blowfish", "cast128", "none", "null", "export"], "category": "broken", "why": "RC4/DES/3DES/Blowfish and null/export ciphers are broken or far below strength", "source": "RFC 7465, NIST SP 800-131A"},
-      {"match": ["aes128-cbc", "aes192-cbc", "aes256-cbc", "rijndael-cbc", "cbc"], "category": "legacy-classical", "why": "CBC-mode SSH ciphers are vulnerable to known plaintext/padding issues, deprecated", "source": "CVE-2008-5161, OpenSSH guidance"},
-      {"match": ["aes128-ctr", "aes192-ctr", "aes192-gcm", "aes128-gcm", "aes128", "aes192"], "category": "quantum-vulnerable", "why": "AES-128 and AES-192 drop below the 128-bit post-quantum target under Grover", "source": "NIST IR 8547"},
-      {"match": ["aes256-ctr", "aes256-gcm", "chacha20-poly1305", "aes256"], "category": "pq-ready", "why": "AES-256 and ChaCha20 keep 128-bit security under Grover, considered quantum-safe symmetric", "source": "NIST IR 8547"}
+      {
+        "match": [
+          "arcfour",
+          "rc4",
+          "des-cbc",
+          "3des",
+          "blowfish",
+          "cast128",
+          "none",
+          "null",
+          "export"
+        ],
+        "category": "broken",
+        "why": "RC4/DES/3DES/Blowfish and null/export ciphers are broken or far below strength",
+        "source": "RFC 7465, NIST SP 800-131A"
+      },
+      {
+        "match": [
+          "aes128-cbc",
+          "aes192-cbc",
+          "aes256-cbc",
+          "rijndael-cbc",
+          "cbc"
+        ],
+        "category": "legacy-classical",
+        "why": "CBC-mode SSH ciphers are vulnerable to known plaintext/padding issues, deprecated",
+        "source": "CVE-2008-5161, OpenSSH guidance"
+      },
+      {
+        "match": [
+          "aes128-ctr",
+          "aes192-ctr",
+          "aes192-gcm",
+          "aes128-gcm",
+          "aes128",
+          "aes192"
+        ],
+        "category": "quantum-vulnerable",
+        "why": "AES-128 and AES-192 are weakened by Grover, not broken; this tool asks for AES-256, a rule stricter than NIST",
+        "source": "Project rule following CNSA 2.0 (AES-256); NIST IR 8547 accepts AES-128 as Category 1"
+      },
+      {
+        "match": [
+          "aes256-ctr",
+          "aes256-gcm",
+          "chacha20-poly1305",
+          "aes256"
+        ],
+        "category": "pq-ready",
+        "why": "AES-256 and ChaCha20 keep at least 128-bit security under Grover",
+        "source": "NIST IR 8547 (AES-256), RFC 8439 (ChaCha20-Poly1305)"
+      }
     ],
     "mac": [
-      {"match": ["hmac-md5", "md5", "none"], "category": "broken", "why": "MD5 MACs are broken", "source": "NIST SP 800-131A"},
-      {"match": ["hmac-sha1", "ripemd160", "umac-64"], "category": "legacy-classical", "why": "SHA-1, RIPEMD-160 and 64-bit-tag UMAC MACs are deprecated or short", "source": "NIST SP 800-131A"},
-      {"match": ["hmac-sha2-256", "umac-128", "hmac-sha2-512"], "category": "pq-ready", "why": "SHA-2 MACs keep adequate security under Grover", "source": "NIST IR 8547"}
+      {
+        "match": [
+          "hmac-md5",
+          "md5",
+          "none"
+        ],
+        "category": "broken",
+        "why": "MD5 MACs are broken",
+        "source": "NIST SP 800-131A"
+      },
+      {
+        "match": [
+          "hmac-sha1",
+          "ripemd160",
+          "umac-64"
+        ],
+        "category": "legacy-classical",
+        "why": "SHA-1, RIPEMD-160 and 64-bit-tag UMAC MACs are phased out of modern SSH defaults",
+        "source": "Project rule following OpenSSH defaults; NIST SP 800-131A still allows HMAC-SHA-1"
+      },
+      {
+        "match": [
+          "hmac-sha2-256",
+          "umac-128",
+          "hmac-sha2-512"
+        ],
+        "category": "pq-ready",
+        "why": "SHA-2 MACs keep adequate security under Grover",
+        "source": "NIST FIPS 198-1 and FIPS 180-4 (HMAC-SHA-2), RFC 4418 (UMAC-128)"
+      }
     ],
     "tls_version": [
-      {"match": ["SSLv2", "SSLv3"], "category": "broken", "why": "SSLv2/SSLv3 are broken (POODLE, DROWN), must be disabled", "source": "RFC 7568, RFC 6176"},
-      {"match": ["TLSv1.0", "TLSv1.1"], "category": "legacy-classical", "why": "TLS 1.0/1.1 are deprecated", "source": "RFC 8996"},
-      {"match": ["TLSv1.2", "TLSv1.3"], "category": "quantum-vulnerable", "why": "TLS 1.2/1.3 with classical key exchange is safe today but Shor-breakable; PQ TLS needs ML-KEM groups", "source": "NIST IR 8547"}
+      {
+        "match": [
+          "SSLv2",
+          "SSLv3"
+        ],
+        "category": "broken",
+        "why": "SSLv2/SSLv3 are broken (POODLE, DROWN), must be disabled",
+        "source": "RFC 7568, RFC 6176"
+      },
+      {
+        "match": [
+          "TLSv1.0",
+          "TLSv1.1"
+        ],
+        "category": "legacy-classical",
+        "why": "TLS 1.0/1.1 are deprecated",
+        "source": "RFC 8996"
+      },
+      {
+        "match": [
+          "TLSv1.2",
+          "TLSv1.3"
+        ],
+        "category": "quantum-vulnerable",
+        "why": "TLS 1.2/1.3 with classical key exchange is safe today but Shor-breakable; PQ TLS needs ML-KEM groups",
+        "source": "NIST IR 8547"
+      }
     ],
     "tls_group": [
-      {"match": ["mlkem", "kyber", "x25519mlkem768", "secp256r1mlkem768", "x448mlkem1024", "secp384r1mlkem1024"], "category": "pq-ready", "why": "Hybrid ML-KEM TLS key exchange (NIST FIPS 203), resists Shor", "source": "NIST FIPS 203, IETF hybrid KEM"},
-      {"match": ["x25519", "x448", "secp256r1", "secp384r1", "secp521r1", "ecdh"], "category": "quantum-vulnerable", "why": "Classical elliptic-curve TLS key exchange, broken by Shor", "source": "NIST IR 8547"},
-      {"match": ["ffdhe2048", "ffdhe", "dhe"], "category": "legacy-classical", "why": "Finite-field Diffie-Hellman TLS group, deprecated and Shor-breakable", "source": "NIST SP 800-131A"}
+      {
+        "match": [
+          "mlkem",
+          "kyber",
+          "x25519mlkem768",
+          "secp256r1mlkem768",
+          "x448mlkem1024",
+          "secp384r1mlkem1024"
+        ],
+        "category": "pq-ready",
+        "why": "Hybrid ML-KEM TLS key exchange (NIST FIPS 203), resists Shor",
+        "source": "NIST FIPS 203, IETF hybrid KEM"
+      },
+      {
+        "match": [
+          "x25519",
+          "x448",
+          "secp256r1",
+          "secp384r1",
+          "secp521r1",
+          "ecdh"
+        ],
+        "category": "quantum-vulnerable",
+        "why": "Classical elliptic-curve TLS key exchange, broken by Shor",
+        "source": "NIST IR 8547"
+      },
+      {
+        "match": [
+          "ffdhe2048",
+          "ffdhe",
+          "dhe"
+        ],
+        "category": "legacy-classical",
+        "why": "Finite-field Diffie-Hellman TLS group, deprecated and Shor-breakable",
+        "source": "NIST SP 800-131A"
+      }
     ],
     "cert_sig": [
-      {"match": ["md5", "md2", "sha1"], "category": "broken", "why": "MD5/MD2/SHA-1 certificate signatures are forgeable", "source": "NIST SP 800-131A"},
-      {"match": ["sha256", "sha384", "sha512", "ecdsa", "rsa"], "category": "quantum-vulnerable", "why": "Classical RSA/ECDSA certificate signature, Shor-breakable", "source": "NIST IR 8547"}
+      {
+        "match": [
+          "md5",
+          "md2",
+          "sha1"
+        ],
+        "category": "broken",
+        "why": "MD5/MD2/SHA-1 certificate signatures are forgeable",
+        "source": "NIST SP 800-131A"
+      },
+      {
+        "match": [
+          "sha256",
+          "sha384",
+          "sha512",
+          "ecdsa",
+          "rsa"
+        ],
+        "category": "quantum-vulnerable",
+        "why": "Classical RSA/ECDSA certificate signature, Shor-breakable",
+        "source": "NIST IR 8547"
+      }
     ]
   }
 }

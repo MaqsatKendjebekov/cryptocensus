@@ -865,7 +865,28 @@ fn robustness_selftest(policy: &Value) {
     // Shor: a prime is rejected fast and a prime power is factored without a period
     assert!(shor_factor(4093).is_none(), "4093 is prime");
     assert_eq!(shor_factor(9).map(|t| (t.0, t.1)), Some((3, 3)));
-    println!("{}", paint("robustness self-checks passed: hostile packets, ident line, name sanitising, dedup, drift gate, fix list, Shor input checks", "92"));
+    // CI gate: no records fails closed, it is never graded as perfect
+    assert_eq!(gate_decision(&[], Some("B")), Gate::NoData);
+    assert_eq!(gate_decision(&[rec("h", "cipher", "3des-cbc")], Some("B")), Gate::Fail("F"));
+    assert_eq!(gate_decision(&[rec("h", "cipher", "aes256-gcm@openssh.com")], Some("B")), Gate::Pass("A"));
+    // downgrade verdicts: a reset or a disconnect is refused; only an open-socket timeout is accepted
+    use std::io::{Error, ErrorKind};
+    assert_eq!(verdict_from_read(&Err(Error::from(ErrorKind::ConnectionReset)), false), Some(Down::Refused));
+    assert_eq!(verdict_from_read(&Err(Error::from(ErrorKind::WouldBlock)), false), Some(Down::Accepted));
+    assert_eq!(verdict_from_read(&Ok(0), false), Some(Down::Refused));
+    assert_eq!(verdict_from_read(&Ok(40), true), Some(Down::Refused));
+    assert_eq!(verdict_from_read(&Ok(40), false), None);
+    // downgrade probes: one per weak algorithm, other slots from the server's strong choices
+    let offer: Vec<(String, String)> = [("kex", "curve25519-sha256"), ("kex", "diffie-hellman-group1-sha1"), ("hostkey", "ssh-ed25519"),
+        ("cipher", "aes256-gcm@openssh.com"), ("cipher", "3des-cbc"), ("cipher", "aes128-cbc"), ("cipher", "aes128-ctr"),
+        ("mac", "hmac-sha2-256"), ("mac", "hmac-md5")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+    let pr = build_probes(&offer);
+    let names: Vec<&str> = pr.iter().map(|p| p.weak.as_str()).collect();
+    assert_eq!(names, vec!["diffie-hellman-group1-sha1", "3des-cbc", "aes128-cbc", "hmac-md5"], "one probe per weak algorithm");
+    assert_eq!(pr[0].cipher.as_deref(), Some("aes256-gcm@openssh.com"), "the kex probe uses a strong cipher");
+    assert_eq!(pr[1].kex.as_deref(), Some("curve25519-sha256"), "the cipher probe uses a strong kex");
+    assert_eq!(pr[3].cipher.as_deref(), Some("aes128-ctr"), "the MAC probe uses a strong non-AEAD cipher");
+    println!("{}", paint("robustness self-checks passed: hostile packets, ident line, name sanitising, dedup, drift gate, fix list, Shor input, CI gate fail-closed, downgrade verdicts and probes", "92"));
 }
 
 // ---------- bench ----------
@@ -1051,7 +1072,7 @@ fn fix_cmd(targets: &str, port: u16, timeout: Duration, workers: usize, policy: 
         if drop.len() > 10 { println!("      {} and {} more", dim("..."), drop.len() - 10); }
         for k in &kept_weak {
             println!("      {} {:8} {} {}", dim("="), k.ctype, paint(&k.value, cat_fg(&k.category)),
-                     dim("kept: OpenSSH has no post-quantum host key yet"));
+                     dim("kept: a post-quantum host key (ssh-mldsa44-ed25519) needs OpenSSH 10.5+ on both sides"));
         }
         println!("    {} {} {:.0}/100 after applying {}", paint("=>", "92"),
                  paint(&format!(" {pred_g} "), cat_bg_for_grade(pred_g)), pred_s, dim(&path));
@@ -1234,8 +1255,48 @@ const WEAK_KEX: [&str; 4] = ["diffie-hellman-group1-sha1", "diffie-hellman-group
 const WEAK_CIPHERS: [&str; 6] = ["3des-cbc", "arcfour", "arcfour128", "arcfour256", "blowfish-cbc", "aes128-cbc"];
 const WEAK_MACS: [&str; 3] = ["hmac-md5", "hmac-md5-96", "hmac-sha1-96"];
 
-fn pick_weak(offered: &BTreeSet<String>, weak: &[&str]) -> Option<String> {
-    weak.iter().find(|w| { let wl = w.to_lowercase(); offered.iter().any(|o| o.contains(&wl)) }).map(|w| w.to_string())
+fn is_weak_name(v: &str, weak: &[&str]) -> bool { let l = v.to_lowercase(); weak.iter().any(|w| l.contains(&w.to_lowercase())) }
+fn weak_list(ctype: &str) -> &'static [&'static str] {
+    match ctype { "kex" => &WEAK_KEX[..], "cipher" => &WEAK_CIPHERS[..], _ => &WEAK_MACS[..] }
+}
+#[derive(Debug, PartialEq)]
+struct Probe { ctype: &'static str, weak: String, kex: Option<String>, cipher: Option<String>, mac: Option<String> }
+// One probe for EVERY weak algorithm the server lists. The weak name goes alone in its slot;
+// the other slots take the server's own strong choices, so a probe can only fail on the
+// algorithm under test. A MAC is only negotiated with a non-AEAD cipher.
+fn build_probes(found: &[(String, String)]) -> Vec<Probe> {
+    let pick = |t: &str, no_aead: bool| -> Option<String> {
+        let ok = |v: &String| !(no_aead && (v.contains("gcm") || v.contains("poly1305")));
+        let slot: Vec<&String> = found.iter().filter(|(c, _)| c == t).map(|(_, v)| v).filter(|v| ok(v)).collect();
+        slot.iter().find(|v| !is_weak_name(v, weak_list(t))).or(slot.first()).map(|v| v.to_string())
+    };
+    let (pk, pc, pm, pc_mac) = (pick("kex", false), pick("cipher", false), pick("mac", false), pick("cipher", true));
+    let mut probes = Vec::new();
+    let mut seen = BTreeSet::new();
+    for ctype in ["kex", "cipher", "mac"] {
+        for (c, v) in found.iter().filter(|(c, _)| c == ctype) {
+            if !is_weak_name(v, weak_list(c)) || !seen.insert(v.clone()) { continue; }
+            let w = Some(v.clone());
+            probes.push(match ctype {
+                "kex" => Probe { ctype: "kex", weak: v.clone(), kex: w, cipher: pc.clone(), mac: pm.clone() },
+                "cipher" => Probe { ctype: "cipher", weak: v.clone(), kex: pk.clone(), cipher: w, mac: pm.clone() },
+                _ => Probe { ctype: "mac", weak: v.clone(), kex: pk.clone(), cipher: pc_mac.clone(), mac: w },
+            });
+        }
+    }
+    probes
+}
+// How one read after our weak KEXINIT maps to a verdict (None = keep reading).
+// A disconnect or a reset is a refusal; only a timeout with the socket still open means
+// the server agreed and is waiting for our next key exchange message.
+fn verdict_from_read(r: &std::io::Result<usize>, disconnect_seen: bool) -> Option<Down> {
+    match r {
+        Ok(0) => Some(Down::Refused),
+        Ok(_) if disconnect_seen => Some(Down::Refused),
+        Ok(_) => None,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Some(Down::Accepted),
+        Err(_) => Some(Down::Refused),
+    }
 }
 // hostkeys: the server's own host key list, so only the slot under test can fail
 fn build_kexinit(kex: &str, hostkeys: &str, cipher: &str, mac: &str) -> Vec<u8> {
@@ -1292,23 +1353,19 @@ fn live_downgrade(ip: Ipv4Addr, port: u16, kex: &str, hostkeys: &str, cipher: &s
     }
     if stream.write_all(&build_kexinit(kex, hostkeys, cipher, mac)).is_err() { return Down::Unknown; }
     let start = Instant::now();
+    // ponytail: heuristic; a host that agrees and then idles looks like a slow one, which is
+    // why accepted is only ever reported for an algorithm the server itself listed
     loop {
-        match stream.read(&mut tmp) {
-            Ok(0) => return Down::Refused,                 // closed with no common algorithm
-            Ok(n) => { buf.extend_from_slice(&tmp[..n]); if ssh_has_msg(&buf, 1) { return Down::Refused; } } // SSH_MSG_DISCONNECT
-            // Only a read TIMEOUT with the socket still open means the server agreed and is
-            // waiting for our key exchange reply. WouldBlock is how Unix reports it, TimedOut
-            // is Windows. ponytail: heuristic; a host that agrees then idles looks the same.
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Down::Accepted,
-            Err(_) => return Down::Refused,                // a reset or abort after our weak offer is a rejection
-        }
+        let r = stream.read(&mut tmp);
+        if let Ok(n) = &r { buf.extend_from_slice(&tmp[..*n]); }
+        if let Some(v) = verdict_from_read(&r, ssh_has_msg(&buf, 1)) { return v; }
         if start.elapsed() > timeout { return Down::Accepted; }
     }
 }
-// One live probe per weak algorithm the server offers. The weak name goes alone in its
-// slot and every other slot is filled from the server's own offer, so the probe can only
-// fail on the algorithm under test. (Proposing DH-group1 + 3DES + MD5 together would make
-// a server that accepts only one of them look safe.)
+// The active downgrade test: one live probe per weak algorithm the server lists (see
+// build_probes). Accepted means a weak session can really be established, which is what an
+// old or attacker-controlled client gets; it is not a man-in-the-middle claim, because SSH
+// signs both KEXINITs into the exchange hash.
 fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
     banner();
     let ips = parse_targets(targets);
@@ -1317,28 +1374,10 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
     for ip in &ips {
         let found = match scan_ssh(*ip, port, timeout) { Some((_, f)) => f, None => { println!("\n  {} {} no SSH", bold("host"), bold(&ip.to_string())); continue; } };
         answered += 1;
-        let offered: BTreeSet<String> = found.iter().map(|(_, v)| v.to_lowercase()).collect();
-        let first = |t: &str, no_aead: bool| found.iter()
-            .find(|(ct, v)| ct == t && !(no_aead && (v.contains("gcm") || v.contains("poly1305"))))
-            .map(|(_, v)| v.clone());
         let hostkeys: Vec<String> = found.iter().filter(|(ct, _)| ct == "hostkey").map(|(_, v)| v.clone()).collect();
         let hk = if hostkeys.is_empty() { "ssh-ed25519,rsa-sha2-256,ssh-rsa".to_string() } else { hostkeys.join(",") };
-        let (pk, pc, pm, pc_mac) = (first("kex", false), first("cipher", false), first("mac", false), first("cipher", true));
         println!("\n  {} {}", bold("host"), bold(&ip.to_string()));
-        let mut probes: Vec<(&str, Option<String>, Option<String>, Option<String>)> = Vec::new();
-        for (ctype, weak) in [("kex", &WEAK_KEX[..]), ("cipher", &WEAK_CIPHERS[..]), ("mac", &WEAK_MACS[..])] {
-            if let Some(pat) = pick_weak(&offered, weak) {
-                let name = found.iter().find(|(ct, v)| ct == ctype && v.to_lowercase().contains(&pat)).map(|(_, v)| v.clone());
-                let shown = name.clone().unwrap_or(pat.clone());
-                let (cat, _, _) = score(policy, ctype, &shown);
-                println!("    {} offers weak {} {} [{}]", paint("!", "91"), ctype, bold(&shown), paint(&cat, cat_fg(&cat)));
-                probes.push(match ctype {
-                    "kex" => (ctype, name, pc.clone(), pm.clone()),
-                    "cipher" => (ctype, pk.clone(), name, pm.clone()),
-                    _ => (ctype, pk.clone(), pc_mac.clone(), name),   // a MAC is only used with a non-AEAD cipher
-                });
-            }
-        }
+        let probes = build_probes(&found);
         if probes.is_empty() {
             println!("    {} no weak kex/cipher/mac in the offer", paint("ok", "92"));
             match live_downgrade(*ip, port, "diffie-hellman-group1-sha1", &hk, "3des-cbc", "hmac-md5", timeout) {
@@ -1348,15 +1387,17 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
             }
             continue;
         }
-        for (ctype, k, c, m) in probes {
-            let (Some(k), Some(c), Some(m)) = (k, c, m) else {
-                println!("    {} cannot build a {ctype} probe from this offer (a MAC test needs a non-AEAD cipher); offered-set verdict stands", dim("note"));
+        for pr in probes {
+            let (cat, _, _) = score(policy, pr.ctype, &pr.weak);
+            println!("    {} offers weak {} {} [{}]", paint("!", "91"), pr.ctype, bold(&pr.weak), paint(&cat, cat_fg(&cat)));
+            let (Some(k), Some(c), Some(m)) = (pr.kex, pr.cipher, pr.mac) else {
+                println!("      {} cannot build a probe from this offer (a MAC test needs a non-AEAD cipher)", dim("note"));
                 continue;
             };
             match live_downgrade(*ip, port, &k, &hk, &c, &m, timeout) {
-                Down::Accepted => println!("    {} weak {ctype} negotiated: {k} / {c} / {m}", paint(" DOWNGRADE ACCEPTED ", "1;37;41")),
-                Down::Refused  => println!("    {} weak {ctype} refused: {k} / {c} / {m}", paint(" refused ", "1;37;42")),
-                Down::Unknown  => println!("    {} live {ctype} probe inconclusive; offered-set verdict stands", dim("note")),
+                Down::Accepted => println!("      {} {k} / {c} / {m}", paint(" DOWNGRADE ACCEPTED ", "1;37;41")),
+                Down::Refused  => println!("      {} {k} / {c} / {m}", paint(" refused ", "1;37;42")),
+                Down::Unknown  => println!("      {} live probe inconclusive", dim("note")),
             }
         }
     }
@@ -1364,13 +1405,13 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
     if answered == 0 { eprintln!("  {} no SSH service answered on {} target(s)", paint("error", "91"), ips.len()); std::process::exit(2); }
 }
 
-// ================= O7: Shor's algorithm (execute the quantum verdict) =================
+// ================= O7: Shor's algorithm (the quantum verdict, demonstrated) =================
 // CryptoCensus labels RSA and classical DH "quantum-vulnerable, broken by Shor".
-// This factors a scanned RSA modulus on a simulated quantum computer and rebuilds
-// the private key, closing the loop from "flagged" to "actually broken". The
+// This factors a small known-answer RSA modulus on a simulated quantum computer and rebuilds
+// the private key, to show the factoring path is real, working code. The
 // modular-exponentiation oracle is evaluated classically, then the inverse QFT (a
-// forward DFT here) runs over the full statevector; the interference peaks reveal
-// the hidden period exactly as on hardware.
+// forward DFT here) runs over the period register; the interference peaks reveal
+// the hidden period as they would on hardware.
 // ponytail: full 2^(2n) statevector. N=3233 needs a 2^24-point FFT (~256MB, a few
 // seconds); capped at 24 qubits, so this demo factors moduli below 4096 and scales
 // the cost of a real key from published estimates instead.
@@ -1437,16 +1478,19 @@ fn cf_denominator(y: u128, q: u128, max_den: u128) -> Option<u128> {
 }
 
 fn shor_period(a: u128, n_mod: u128, q_bits: u32) -> Option<u128> {
-    // actual multiplicative order of a mod N (classical oracle period)
-    let mut order = 0u128; let mut cur = 1u128 % n_mod;
-    loop { order += 1; cur = mulmod(cur, a, n_mod); if cur == 1 { break; } if order > n_mod { return None; } }
     let q = 1usize << q_bits;
-    // measure work register, condition on residue 1 -> comb on multiples of the order
+    // Measure the work register and keep the outcome 1: the counting register collapses onto
+    // every x with a^x mod N == 1. A classical simulation evaluates that oracle directly, so
+    // the period is implicit in the state; the QFT and continued fractions must recover it.
+    // This checks the quantum steps are correct; it is not a speed-up.
     let mut psi = vec![Cpx { re: 0.0, im: 0.0 }; q];
-    let step = order as usize;
+    let mut cur = 1u128 % n_mod;
     let mut set = 0u64;
-    let mut idx = 0usize;
-    while idx < q { psi[idx].re = 1.0; set += 1; idx += step; }
+    for amp in psi.iter_mut() {
+        if cur == 1 { amp.re = 1.0; set += 1; }
+        cur = mulmod(cur, a, n_mod);
+    }
+    if set == 0 { return None; }
     let norm = (set as f64).sqrt();
     for c in psi.iter_mut() { c.re /= norm; }
     fft_forward(&mut psi);                 // the one genuinely quantum step
@@ -1655,7 +1699,8 @@ fn batchgcd_run(keys: usize, bits: u64) {
     banner();
     let small = small_primes(2000);
     let mut rng = Xorshift(0x9E3779B97F4A7C15);
-    println!("  {} building a corpus of {keys} RSA-{} keys with low-entropy collisions", bold("[*]"), 2 * bits);
+    let size_note = if 2 * bits < 2048 { " (toy size so it runs live; the method is the same at RSA-2048)" } else { "" };
+    println!("  {} building a corpus of {keys} RSA-{} keys with a planted shared prime{size_note}", bold("[*]"), 2 * bits);
     let planted = gen_prime(&mut rng, bits, &small);
     let mut moduli: Vec<BigUint> = Vec::with_capacity(keys + 2);
     let mut labels: Vec<String> = Vec::with_capacity(keys + 2);
@@ -1690,7 +1735,11 @@ fn batchgcd_run(keys: usize, bits: u64) {
     let dt = t0.elapsed().as_secs_f64();
     println!("  {} batch-GCD finished in {:.2}s and factored {} key(s)", paint("[+]", "92"), dt, factored);
     if factored > 0 {
-        println!("  {} a {}-bit key is strong on paper, broken by shared entropy", paint("[+]", "92"), moduli[moduli.len() - 1].bits());
+        if 2 * bits >= 2048 {
+            println!("  {} an RSA-{} key is strong on paper, broken by shared entropy", paint("[+]", "92"), 2 * bits);
+        } else {
+            println!("  {} the planted pair fell to weak randomness, not to key size", paint("[+]", "92"));
+        }
     } else {
         println!("  {} no shared primes found in the corpus", paint("[-]", "93"));
     }
@@ -2055,7 +2104,7 @@ fn remediation_plan(recs: &[Record]) -> String {
         "kex" => "mlkem768x25519-sha256 or sntrup761x25519-sha512",
         "cipher" => "aes256-gcm or chacha20-poly1305",
         "mac" => "hmac-sha2-256-etm or hmac-sha2-512-etm",
-        "hostkey" => "ssh-ed25519 (the strongest available; OpenSSH has no post-quantum host key yet)",
+        "hostkey" => "ssh-mldsa44-ed25519 where both sides run OpenSSH 10.5+, otherwise ssh-ed25519",
         "tls_group" => "X25519MLKEM768",
         _ => "a post-quantum ready equivalent",
     };
@@ -2068,7 +2117,6 @@ fn remediation_plan(recs: &[Record]) -> String {
         }
         for (host, kinds) in &by_host {
             for (ctype, values) in kinds {
-                if band == "quantum-vulnerable" && *ctype == "hostkey" { continue; }   // nothing better exists yet
                 step += 1;
                 s.push_str(&format!("{step}. {host}, {band} ({when}): {verb} {ctype} {}; use {}.\n", values.join(", "), target(ctype)));
             }
@@ -2224,6 +2272,19 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+#[derive(Debug, PartialEq)]
+enum Gate { NoData, Pass(&'static str), Fail(&'static str) }
+// The CI decision. No records is NoData (the caller exits 2), never a perfect score.
+fn gate_decision(recs: &[Record], threshold: Option<&str>) -> Gate {
+    if recs.is_empty() { return Gate::NoData; }
+    let all: Vec<&Record> = recs.iter().collect();
+    let (g, _) = grade(readiness(&all));
+    match threshold {
+        Some(t) if grade_rank(g) < grade_rank(t) => Gate::Fail(g),
+        _ => Gate::Pass(g),
+    }
+}
+
 // A numeric flag that is given must parse and be in range. A typo must never fall back to
 // a default silently, because that is how a broken scan ends up looking like a clean one.
 fn num_flag<T: std::str::FromStr + PartialOrd + Copy + std::fmt::Display>(args: &[String], name: &str, default: T, min: T, max: T) -> T {
@@ -2262,7 +2323,7 @@ fn main() {
             let (recs, banners) = scan_targets(&ips, port, timeout, workers, &policy, true);
             // Zero answers is not a perfect score. Fail closed (exit 2), grade nothing and keep
             // the previous results, so an offline or penalised host can never pass the gate.
-            if recs.is_empty() {
+            if gate_decision(&recs, None) == Gate::NoData {
                 eprintln!("  {} no SSH service answered on {} target(s), port {port}; nothing graded, previous results kept", paint("error", "91"), ips.len());
                 std::process::exit(2);
             }
@@ -2276,13 +2337,14 @@ fn main() {
             println!("  {} {outdir}/inventory.json | {outdir}/cbom.json | {outdir}/report.html | {outdir}/cryptocensus.sarif",
                      dim("written:"));
             if let Some(thr) = gate {
-                let all: Vec<&Record> = recs.iter().collect();
-                let (og, _) = grade(readiness(&all));
-                if grade_rank(og) < grade_rank(&thr) {
-                    eprintln!("  {} overall grade {og} is below the --fail-under {thr} threshold", paint("GATE FAIL", "91"));
-                    std::process::exit(1);
+                match gate_decision(&recs, Some(&thr)) {
+                    Gate::Fail(og) => {
+                        eprintln!("  {} overall grade {og} is below the --fail-under {thr} threshold", paint("GATE FAIL", "91"));
+                        std::process::exit(1);
+                    }
+                    Gate::Pass(og) => eprintln!("  {} overall grade {og} meets the --fail-under {thr} threshold", paint("gate ok", "92")),
+                    Gate::NoData => std::process::exit(2),
                 }
-                eprintln!("  {} overall grade {og} meets the --fail-under {thr} threshold", paint("gate ok", "92"));
             }
         }
         "bench" => {
@@ -2300,7 +2362,7 @@ fn main() {
             eprintln!("  {} native TLS 1.3 handshake, {} target(s) on port {tport}", bold("probing"), ips.len());
             let t0 = Instant::now();
             let recs = tls_scan(&ips, tport, timeout, workers, &policy);
-            if recs.is_empty() {
+            if gate_decision(&recs, None) == Gate::NoData {
                 eprintln!("  {} no TLS 1.3 service answered on {} target(s), port {tport}; nothing graded, previous results kept", paint("error", "91"), ips.len());
                 std::process::exit(2);
             }
