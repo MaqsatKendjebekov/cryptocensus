@@ -11,6 +11,24 @@ every key exchange, host key, cipher and MAC it supports. CryptoCensus reads tha
 packet directly (no nmap, no crypto handshake), so a whole /24 takes about a
 second.
 
+![CryptoCensus demo: scan, downgrade test, Shor, batch-GCD, fix, diff, roadmap and the checked AI brief](docs/demo.gif)
+
+The `report` command writes a self-contained HTML dashboard: the grade, the
+readiness bands, the AI summary checked against the engine, and the
+engine-computed remediation plan.
+
+![The HTML dashboard for a two-host lab](docs/dashboard.png)
+
+## Quick start
+
+```
+git clone https://github.com/MaqsatKendjebekov/cryptocensus && cd cryptocensus
+cargo build --release
+./target/release/cryptocensus selftest
+./target/release/cryptocensus scan --targets 192.168.56.0/24 --out results
+./target/release/cryptocensus report --out results     # then open results/heatmap.html
+```
+
 ## Build
 
 ```
