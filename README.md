@@ -76,8 +76,12 @@ cryptocensus bench     --targets <IPs|CIDR> [--nmap]
 cryptocensus selftest
 ```
 
+Add `--json` to `scan`, `tls`, `downgrade`, `fix` or `diff` for machine-readable output.
+
 Each scan writes `inventory.json`, a CycloneDX 1.6 `cbom.json`, an HTML heatmap
-`report.html`, and a SARIF 2.1.0 file for CI.
+`report.html`, and a SARIF 2.1.0 file for CI. With `--append`, `scan` and `tls`
+merge into the inventory already in `--out`, so the SSH and TLS results of the same
+hosts land in one CBOM (a re-scanned host:port replaces its old records).
 
 Exit codes: `0` success, `1` a gate failed (`--fail-under`, `--fail-on-regression`),
 `2` an error, including a scan where no host answered. A scan that sees nothing is
@@ -87,8 +91,10 @@ never graded: it exits 2 and keeps the previous results.
 the server lists (the policy's red and orange bands), with that algorithm alone in its
 slot and the server's own non-weak choices in the others, so a server that accepts a
 single weak algorithm is caught. A disconnect or reset counts
-as refused; accepted means the connection stays open, waiting for the client's key
-exchange message, and it is only reported for an algorithm the server listed. This
+as refused. When the server agrees, the probe completes the key exchange with a
+random key share (DH groups, group exchange, curve25519, curve448, P-256,
+sntrup761x25519, or mlkem768x25519 with a well-formed FIPS 203 key) and waits for the
+server's signed reply, so ACCEPTED means the server really ran the exchange. This
 shows what an old or attacker-controlled client gets. It is not a man-in-the-middle
 claim: SSH signs both KEXINITs into the exchange hash.
 
@@ -124,7 +130,24 @@ cryptocensus report --ai --out results
 cryptocensus ask "which host is the worst and why?" --out results
 ```
 
-`ask` answers come from the same computed findings and are advisory.
+`ask` answers come from the same computed findings and are advisory; a wrong
+worst-host answer is asked again once, and then the engine answers instead.
+
+## Use it from an AI agent
+
+`scan`, `tls`, `downgrade`, `fix` and `diff` take `--json`: stdout then carries one JSON
+document (errors too, with `"exit": 2`), and the human view moves to stderr. The
+fields are documented in `skills/cryptocensus/reference/json-output.md`.
+
+`skills/cryptocensus/` is an agent skill (a `SKILL.md` in the open Agent Skills format):
+it teaches an agent the audit workflow, how to read every verdict, and the rules (scan
+only authorised hosts, never change a server without approval, report only what was
+measured). `skills/cryptocensus/scripts/audit.sh <targets> [ssh_port] [tls_port]` runs a
+whole read-only audit and prints one JSON summary. For Claude Code:
+
+```
+ln -s "$PWD/skills/cryptocensus" ~/.claude/skills/cryptocensus
+```
 
 ## Testing against OpenSSH 9.8 or newer
 

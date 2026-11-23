@@ -31,6 +31,34 @@ const KEX_SKIP: [&str; 2] = ["ext-info-", "kex-strict-"];
 
 // ---------- ANSI ----------
 static USE_COLOR: AtomicUsize = AtomicUsize::new(1);
+// --json: stdout carries exactly one JSON document for an agent or a script; the human view
+// (tables, verdict lines) moves to stderr, without colour.
+static JSON_OUT: AtomicUsize = AtomicUsize::new(0);
+fn json_mode() -> bool { JSON_OUT.load(Ordering::Relaxed) == 1 }
+macro_rules! out { ($($t:tt)*) => { if json_mode() { eprintln!($($t)*) } else { println!($($t)*) } } }
+fn emit_json(v: &Value) { if json_mode() { println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()); } }
+// a fatal error as JSON too, so an agent never has to parse stderr to learn why it stopped
+fn json_fail(command: &str, error: &str, code: i32) -> ! {
+    emit_json(&json!({"command": command, "error": error, "exit": code}));
+    std::process::exit(code)
+}
+fn grade_json(score: f64) -> Value { json!({"grade": grade(score).0, "score": score.round() as i64}) }
+// Per-host and overall verdicts of an inventory, plus every non-pq-ready finding.
+fn inventory_json(recs: &[Record]) -> Value {
+    let mut by_host: BTreeMap<&str, Vec<&Record>> = BTreeMap::new();
+    for r in recs { by_host.entry(r.host.as_str()).or_default().push(r); }
+    let all: Vec<&Record> = recs.iter().collect();
+    let hosts: Vec<Value> = by_host.iter().map(|(h, rs)| {
+        let mut counts: BTreeMap<&str, usize> = ["broken", "legacy-classical", "quantum-vulnerable", "pq-ready"].iter().map(|k| (*k, 0)).collect();
+        for r in rs { *counts.entry(r.category.as_str()).or_insert(0) += 1; }
+        let ports: BTreeSet<u16> = rs.iter().map(|r| r.port).collect();
+        let weak: Vec<Value> = rs.iter().filter(|r| r.category != "pq-ready").map(|r| json!({
+            "service": r.service, "port": r.port, "ctype": r.ctype, "value": r.value, "category": r.category, "source": r.source
+        })).collect();
+        json!({"host": h, "ports": ports, "verdict": grade_json(readiness(rs)), "counts": counts, "findings": weak})
+    }).collect();
+    json!({"overall": grade_json(readiness(&all)), "parameters": recs.len(), "hosts": hosts})
+}
 fn paint(s: &str, code: &str) -> String {
     if USE_COLOR.load(Ordering::Relaxed) == 1 {
         format!("\x1b[{code}m{s}\x1b[0m")
@@ -725,8 +753,8 @@ fn build_dashboard(recs: &[Record], stamp: &str, brief: Option<Brief>) -> String
 fn print_summary(recs: &[Record], banners: &BTreeMap<String, String>) {
     let mut hosts: BTreeMap<String, Vec<&Record>> = BTreeMap::new();
     for r in recs { hosts.entry(r.host.clone()).or_default().push(r); }
-    println!("\n{}", bold("  host             grade  readiness   broken legacy quantum pq   bar"));
-    println!("  {}", dim(&"-".repeat(78)));
+    out!("\n{}", bold("  host             grade  readiness   broken legacy quantum pq   bar"));
+    out!("  {}", dim(&"-".repeat(78)));
     for (host, rs) in &hosts {
         let score = readiness(rs);
         let (g, gcol) = grade(score);
@@ -738,7 +766,7 @@ fn print_summary(recs: &[Record], banners: &BTreeMap<String, String>) {
         for cat in ["broken", "legacy-classical", "quantum-vulnerable", "pq-ready"] {
             for _ in 0..get(cat) { bar.push_str(&paint("█", cat_fg(cat))); }
         }
-        println!("  {:<16} {}   {:>5.0}/100   {:>5}  {:>5}  {:>6}  {:>3}   {}",
+        out!("  {:<16} {}   {:>5.0}/100   {:>5}  {:>5}  {:>6}  {:>3}   {}",
                  bold(host), paint(&format!(" {g} "), cat_bg_for_grade(g)),
                  score,
                  paint(&get("broken").to_string(), "91"),
@@ -752,8 +780,8 @@ fn print_summary(recs: &[Record], banners: &BTreeMap<String, String>) {
     let all: Vec<&Record> = recs.iter().collect();
     let overall = readiness(&all);
     let (og, _) = grade(overall);
-    println!("  {}", dim(&"-".repeat(78)));
-    println!("  {} network readiness {}  ({} params, {} hosts)\n",
+    out!("  {}", dim(&"-".repeat(78)));
+    out!("  {} network readiness {}  ({} params, {} hosts)\n",
              bold("OVERALL"),
              paint(&format!(" {og}  {overall:.0}/100 "), cat_bg_for_grade(og)),
              recs.len(), hosts.len());
@@ -889,6 +917,12 @@ fn robustness_selftest(policy: &Value) {
     assert_eq!(pr[0].cipher.as_deref(), Some("aes256-gcm@openssh.com"), "the kex probe uses a strong cipher");
     assert_eq!(pr[1].kex.as_deref(), Some("curve25519-sha256"), "the cipher probe uses a strong kex");
     assert_eq!(pr[3].cipher.as_deref(), Some("aes128-ctr"), "the MAC probe uses a strong non-AEAD cipher");
+    // --json: the machine view carries the same verdicts as the human table
+    let jv = inventory_json(&[rec("h", "cipher", "3des-cbc"), rec("h", "kex", "mlkem768x25519-sha256")]);
+    assert_eq!(jv["parameters"], 2);
+    assert_eq!(jv["hosts"][0]["counts"]["broken"], 1);
+    assert_eq!(jv["hosts"][0]["findings"].as_array().map(|a| a.len()), Some(1), "only non-pq-ready findings are listed");
+    assert_eq!(jv["overall"]["grade"], grade(readiness(&[&rec("h", "cipher", "3des-cbc"), &rec("h", "kex", "mlkem768x25519-sha256")])).0);
     // --append: the same endpoint is replaced, another endpoint is kept
     let old = vec![rec("h", "cipher", "3des-cbc"), Record { port: 4443, service: "tls".into(), ctype: "tls_group".into(), value: "x25519".into(), ..rec("h", "kex", "x") }];
     let merged = merge_records(old, vec![rec("h", "cipher", "aes256-gcm@openssh.com")]);
@@ -925,6 +959,17 @@ fn robustness_selftest(policy: &Value) {
     let lhs = (&gy * &gy) % &pp;
     let rhs = ((&gx * &gx * &gx) + &bb + (&pp * 3u32) - (&gx * 3u32) % &pp) % &pp;
     assert_eq!(lhs, rhs, "P-256 generator must be on the curve");
+    // a signed reply has the RFC 4253 shape; a stray byte 31 or trailing junk does not count
+    let mut ks = ssh_string(b"ssh-ed25519"); ks.extend(ssh_string(&[7u8; 32]));
+    let mut sig = ssh_string(b"ssh-ed25519"); sig.extend(ssh_string(&[9u8; 64]));
+    let mut good = vec![31u8]; good.extend(ssh_string(&ks)); good.extend(ssh_string(&[5u8; 32])); good.extend(ssh_string(&sig));
+    assert!(kex_reply_ok(&good), "a well-formed reply passes");
+    assert!(!kex_reply_ok(&[31u8]) && !kex_reply_ok(b"\x1fnot a signed reply"), "a stray 31 is not a signed reply");
+    let mut junk = good.clone(); junk.push(0);
+    assert!(!kex_reply_ok(&junk), "nothing may follow the signature");
+    let mut early = b"SSH-2.0-test\r\n".to_vec(); early.extend(ssh_packet(&good));
+    let mark = early.len();
+    assert!(ssh_packets(&early).iter().all(|(at, _)| *at < mark), "a reply sent before our message starts before the mark");
     // a GEX group reply parses, and a reply packet is found after the ident line
     let mut gg = vec![31u8]; gg.extend(mpint(&BigUint::from(0xC5u32))); gg.extend(mpint(&BigUint::from(2u32)));
     assert_eq!(parse_gex_p(&gg), Some(BigUint::from(0xC5u32)));
@@ -1097,8 +1142,9 @@ fn fix_cmd(targets: &str, port: u16, timeout: Duration, workers: usize, policy: 
     let (recs, _) = scan_targets(&ips, port, timeout, workers, policy, true);
     if recs.is_empty() {
         eprintln!("  {} no SSH service answered on {} target(s), port {port}; nothing to remediate", paint("error", "91"), ips.len());
-        std::process::exit(2);
+        json_fail("fix", "no SSH service answered", 2);
     }
+    let mut hosts_json: Vec<Value> = Vec::new();
     let mut hosts: BTreeMap<String, Vec<&Record>> = BTreeMap::new();
     for r in &recs { hosts.entry(r.host.clone()).or_default().push(r); }
     let dir = format!("{outdir}/fix");
@@ -1112,21 +1158,26 @@ fn fix_cmd(targets: &str, port: u16, timeout: Duration, workers: usize, policy: 
         let file = format!("{host}_99-cryptocensus.conf");
         let path = format!("{dir}/{file}");
         write_file(&path, &hardened_conf(host, &file));
-        println!("\n  {} {}", bold("host"), bold(host));
-        println!("    now {} {:.0}/100, {} weak parameter(s) to drop:",
+        out!("\n  {} {}", bold("host"), bold(host));
+        out!("    now {} {:.0}/100, {} weak parameter(s) to drop:",
                  paint(&format!(" {bg} "), cat_bg_for_grade(bg)), before, drop.len());
         for w in drop.iter().take(10) {
-            println!("      {} {:8} {}", paint("-", "91"), w.ctype, paint(&w.value, cat_fg(&w.category)));
+            out!("      {} {:8} {}", paint("-", "91"), w.ctype, paint(&w.value, cat_fg(&w.category)));
         }
-        if drop.len() > 10 { println!("      {} and {} more", dim("..."), drop.len() - 10); }
+        if drop.len() > 10 { out!("      {} and {} more", dim("..."), drop.len() - 10); }
         for k in &kept_weak {
-            println!("      {} {:8} {} {}", dim("="), k.ctype, paint(&k.value, cat_fg(&k.category)),
+            out!("      {} {:8} {} {}", dim("="), k.ctype, paint(&k.value, cat_fg(&k.category)),
                      dim("kept: clients accept the post-quantum ssh-mldsa44-ed25519 by default only from OpenSSH 10.6"));
         }
-        println!("    {} {} {:.0}/100 after applying {}", paint("=>", "92"),
+        let item = |r: &&&Record| json!({"ctype": r.ctype, "value": r.value, "category": r.category});
+        hosts_json.push(json!({"host": host, "current": grade_json(before), "predicted": grade_json(pred_s),
+            "drop": drop.iter().map(item).collect::<Vec<_>>(), "kept": kept_weak.iter().map(item).collect::<Vec<_>>(), "file": path}));
+        out!("    {} {} {:.0}/100 after applying {}", paint("=>", "92"),
                  paint(&format!(" {pred_g} "), cat_bg_for_grade(pred_g)), pred_s, dim(&path));
     }
-    println!("\n  {} drop-in configs in {dir}/. Apply, re-scan, and `cryptocensus diff` to prove the lift.\n", dim("written:"));
+    out!("\n  {} drop-in configs in {dir}/. Apply, re-scan, and `cryptocensus diff` to prove the lift.\n", dim("written:"));
+    emit_json(&json!({"command": "fix", "port": port, "hosts": hosts_json,
+        "next": "review the drop-in, install it with sshd -t, re-scan, then cryptocensus diff before/inventory.json after/inventory.json --fail-on-regression"}));
 }
 
 // ----- Feature 2: drift. Diff two inventories and fail CI on a regression -----
@@ -1212,41 +1263,47 @@ fn diff_cmd(old_path: &str, new_path: &str, fail_on_regression: bool) {
     let old = load_inventory(old_path);
     let new = load_inventory(new_path);
     let d = drift(&old, &new);
-    println!("\n  {}  {}  vs  {}", bold("CryptoCensus drift"), dim(old_path), dim(new_path));
-    let line = |sign: String, r: &Record| println!("    {} {}:{} {} {} [{}]", sign, r.host, r.port, r.ctype, bold(&r.value), paint(&r.category, cat_fg(&r.category)));
+    out!("\n  {}  {}  vs  {}", bold("CryptoCensus drift"), dim(old_path), dim(new_path));
+    let line = |sign: String, r: &Record| out!("    {} {}:{} {} {} [{}]", sign, r.host, r.port, r.ctype, bold(&r.value), paint(&r.category, cat_fg(&r.category)));
 
-    println!("\n  {}", bold("added"));
+    out!("\n  {}", bold("added"));
     for r in &d.added {
         let sign = if is_weak(&r.category) { paint("+!", "91") } else { paint("+", "92") };
         line(sign, r);
     }
-    if d.added.is_empty() { println!("    {}", dim("none")); }
+    if d.added.is_empty() { out!("    {}", dim("none")); }
 
-    println!("  {}", bold("removed"));
+    out!("  {}", bold("removed"));
     for r in &d.removed {
         let sign = if is_weak(&r.category) { paint("-", "92") } else if pq_lost(r, &new) { paint("-!", "91") } else { dim("-") };
         line(sign, r);
     }
-    if d.removed.is_empty() { println!("    {}", dim("none")); }
+    if d.removed.is_empty() { out!("    {}", dim("none")); }
 
-    println!("  {}", bold("grade change"));
+    out!("  {}", bold("grade change"));
     for (h, os, ns) in &d.hosts {
         match (os, ns) {
             (Some(o), Some(n)) => {
                 let (ogd, _) = grade(*o); let (ngd, _) = grade(*n);
                 let tag = if n > o { paint("improved", "92") } else if n < o { paint("regressed", "91") } else { dim("same") };
-                println!("    {:<16} {} {:>3.0}  to  {} {:>3.0}   {}", bold(h),
+                out!("    {:<16} {} {:>3.0}  to  {} {:>3.0}   {}", bold(h),
                          paint(&format!(" {ogd} "), cat_bg_for_grade(ogd)), o,
                          paint(&format!(" {ngd} "), cat_bg_for_grade(ngd)), n, tag);
             }
-            (None, Some(_)) => println!("    {:<16} {}", bold(h), paint("host appeared", "93")),
-            (Some(_), None) => println!("    {:<16} {}", bold(h), paint("host gone from the new scan (counted as a regression)", "91")),
+            (None, Some(_)) => out!("    {:<16} {}", bold(h), paint("host appeared", "93")),
+            (Some(_), None) => out!("    {:<16} {}", bold(h), paint("host gone from the new scan (counted as a regression)", "91")),
             (None, None) => {}
         }
     }
-    println!("\n  {} {} improvement(s), {} regression(s)\n", bold("summary"),
+    out!("\n  {} {} improvement(s), {} regression(s)\n", bold("summary"),
              paint(&d.improvements.to_string(), "92"),
              paint(&d.regressions.to_string(), if d.regressions > 0 { "91" } else { "92" }));
+    let item = |r: &Record| json!({"host": r.host, "port": r.port, "ctype": r.ctype, "value": r.value, "category": r.category});
+    emit_json(&json!({"command": "diff", "before": old_path, "after": new_path,
+        "improvements": d.improvements, "regressions": d.regressions,
+        "added": d.added.iter().map(item).collect::<Vec<_>>(), "removed": d.removed.iter().map(item).collect::<Vec<_>>(),
+        "hosts": d.hosts.iter().map(|(h, o, n)| json!({"host": h, "before": o.map(grade_json), "after": n.map(grade_json)})).collect::<Vec<_>>(),
+        "gate": {"fail_on_regression": fail_on_regression, "pass": !(fail_on_regression && d.regressions > 0)}}));
     if fail_on_regression && d.regressions > 0 {
         eprintln!("  {} regression gate: {} regression(s)", paint("FAIL", "91"), d.regressions);
         std::process::exit(1);
@@ -1321,10 +1378,10 @@ fn client_kex_check(policy: &Value) {
     let Some(first) = text.lines().find_map(|l| l.strip_prefix("kexalgorithms ")).and_then(|v| v.split(',').next()) else { return };
     let (cat, _, _) = score(policy, "kex", first);
     if cat == "pq-ready" {
-        println!("  {} the ssh client on this machine prefers {first} first", paint("client", "92"));
+        out!("  {} the ssh client on this machine prefers {first} first", paint("client", "92"));
     } else {
-        println!("  {} the ssh client on this machine prefers {} [{}] first,", paint("client", "93"), bold(first), paint(&cat, cat_fg(&cat)));
-        println!("         so every server that still offers it gets a classical session");
+        out!("  {} the ssh client on this machine prefers {} [{}] first,", paint("client", "93"), bold(first), paint(&cat, cat_fg(&cat)));
+        out!("         so every server that still offers it gets a classical session");
     }
 }
 
@@ -1462,23 +1519,48 @@ fn parse_gex_p(payload: &[u8]) -> Option<BigUint> {
 // scan the cleartext SSH stream for a packet of the given message type
 fn ssh_has_msg(buf: &[u8], msg: u8) -> bool { ssh_find_payload(buf, msg).is_some() }
 fn ssh_find_payload(buf: &[u8], msg: u8) -> Option<Vec<u8>> {
+    ssh_packets(buf).into_iter().find(|(_, p)| p.first() == Some(&msg)).map(|(_, p)| p)
+}
+// Every complete cleartext packet after the ident line, with its start offset in `buf`.
+// The size bound matches the scan buffer, so a large KEXINIT cannot hide later packets.
+fn ssh_packets(buf: &[u8]) -> Vec<(usize, Vec<u8>)> {
+    let mut out = Vec::new();
     let mut i = 0;
     if let Some(p) = find_ident(buf) {
         if let Some(nl) = buf[p..].iter().position(|&b| b == b'\n') { i = p + nl + 1; }
     }
     while i + 5 <= buf.len() {
         let pkt_len = u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
-        if pkt_len < 2 || pkt_len > 35000 || i + 4 + pkt_len > buf.len() { break; }
+        if pkt_len < 2 || pkt_len > 65536 || i + 4 + pkt_len > buf.len() { break; }
         let pad = buf[i + 4] as usize;
-        let payload_start = i + 5;
         let payload_end = (i + 4 + pkt_len).saturating_sub(pad);   // hostile pad must not underflow
-        if payload_end > payload_start && payload_end <= buf.len() && buf[payload_start] == msg {
-            return Some(buf[payload_start..payload_end].to_vec());
-        }
+        if payload_end > i + 5 { out.push((i, buf[i + 5..payload_end].to_vec())); }
         i += 4 + pkt_len;
     }
-    None
+    out
 }
+fn ssh_str(b: &[u8], i: usize) -> Option<(&[u8], usize)> {
+    let n = u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?) as usize;
+    Some((b.get(i + 4..i + 4 + n)?, i + 4 + n))
+}
+// A key exchange reply (RFC 4253 section 8, RFC 4419 section 3, RFC 5656 section 4, and the
+// hybrid KEM drafts) is exactly: string K_S, string f or Q_S, string signature. K_S starts with
+// the host key type, the signature is string algorithm then string blob. Anything else is not
+// a signed reply, so a server cannot fake a completed exchange with a stray byte 31.
+fn kex_reply_ok(p: &[u8]) -> bool {
+    let parse = || -> Option<bool> {
+        let (ks, i) = ssh_str(p, 1)?;
+        let (share, i) = ssh_str(p, i)?;
+        let (sig, i) = ssh_str(p, i)?;
+        let (ktype, j) = ssh_str(ks, 0)?;
+        let (salg, k) = ssh_str(sig, 0)?;
+        let (sblob, k) = ssh_str(sig, k)?;
+        Some(i == p.len() && !share.is_empty() && j < ks.len() && k == sig.len() && !sblob.is_empty()
+             && valid_alg_name(&String::from_utf8_lossy(ktype)) && valid_alg_name(&String::from_utf8_lossy(salg)))
+    };
+    p.len() > 1 && parse().unwrap_or(false)
+}
+fn gex_group_ok(p: &[u8]) -> bool { parse_gex_p(p).is_some() }
 #[derive(PartialEq, Debug)]
 enum Down { Completed, Accepted, Refused, Unknown }
 fn live_downgrade(ip: Ipv4Addr, port: u16, kex: &str, hostkeys: &str, cipher: &str, mac: &str, timeout: Duration) -> Down {
@@ -1492,14 +1574,18 @@ fn live_downgrade(ip: Ipv4Addr, port: u16, kex: &str, hostkeys: &str, cipher: &s
     for _ in 0..4 {   // read server ident + its KEXINIT
         match stream.read(&mut tmp) { Ok(0) => break, Ok(n) => { buf.extend_from_slice(&tmp[..n]); if buf.len() > 64 { break; } }, Err(_) => break }
     }
+    // A server that dropped us before its ident (MaxStartups or PerSourcePenalties answer
+    // "Not allowed at this time") never saw a weak proposal, so it proves nothing either way.
+    if find_ident(&buf).is_none() { return Down::Unknown; }
     if stream.write_all(&build_kexinit(kex, hostkeys, cipher, mac)).is_err() { return Down::Unknown; }
     let start = Instant::now();
-    let mut verdict = Down::Accepted;
+    let mut verdict = Down::Unknown;
     loop {
         let r = stream.read(&mut tmp);
         if let Ok(n) = &r { buf.extend_from_slice(&tmp[..*n]); }
         if let Some(v) = verdict_from_read(&r, ssh_has_msg(&buf, 1)) { verdict = v; break; }
-        if start.elapsed() > timeout { break; }
+        // still talking at the deadline, or flooding: neither agreement nor refusal is shown
+        if start.elapsed() > timeout || buf.len() > 200_000 { break; }
     }
     if verdict != Down::Accepted { return verdict; }
     // The server agreed and waits. Send our key exchange message: a reply signed with the host
@@ -1508,13 +1594,16 @@ fn live_downgrade(ip: Ipv4Addr, port: u16, kex: &str, hostkeys: &str, cipher: &s
     // because the negotiation already succeeded; it is never turned into refused.
     if complete_kex(&mut stream, &mut buf, kex, timeout) { Down::Completed } else { Down::Accepted }
 }
-fn read_msg(stream: &mut TcpStream, buf: &mut Vec<u8>, msg: u8, timeout: Duration) -> Option<Vec<u8>> {
+// Wait for a packet of type `msg` that starts at or after `from` (nothing the server sent
+// before our message can count) and passes `ok`.
+fn read_msg(stream: &mut TcpStream, buf: &mut Vec<u8>, msg: u8, from: usize, timeout: Duration, ok: fn(&[u8]) -> bool) -> Option<Vec<u8>> {
     let start = Instant::now();
     let mut tmp = [0u8; 8192];
+    let found = |b: &[u8]| ssh_packets(b).into_iter().find(|(at, p)| *at >= from && p.first() == Some(&msg) && ok(p)).map(|(_, p)| p);
     loop {
-        if let Some(p) = ssh_find_payload(buf, msg) { return Some(p); }
+        if let Some(p) = found(buf) { return Some(p); }
         if ssh_has_msg(buf, 1) || start.elapsed() > timeout || buf.len() > 200_000 { return None; }
-        match stream.read(&mut tmp) { Ok(0) | Err(_) => return ssh_find_payload(buf, msg), Ok(n) => buf.extend_from_slice(&tmp[..n]) }
+        match stream.read(&mut tmp) { Ok(0) | Err(_) => return found(buf), Ok(n) => buf.extend_from_slice(&tmp[..n]) }
     }
 }
 fn complete_kex(stream: &mut TcpStream, buf: &mut Vec<u8>, kex: &str, timeout: Duration) -> bool {
@@ -1523,17 +1612,20 @@ fn complete_kex(stream: &mut TcpStream, buf: &mut Vec<u8>, kex: &str, timeout: D
         // RFC 4419: request a group, then send e for the group the server chose
         let mut req = vec![34u8];
         for v in [1024u32, 2048, 8192] { req.extend_from_slice(&v.to_be_bytes()); }
+        let mark = buf.len();
         if stream.write_all(&ssh_packet(&req)).is_err() { return false; }
-        let Some(p) = read_msg(stream, buf, 31, timeout).as_deref().and_then(parse_gex_p) else { return false };
+        let Some(p) = read_msg(stream, buf, 31, mark, timeout, gex_group_ok).as_deref().and_then(parse_gex_p) else { return false };
         if p.bits() < 512 { return false; }
         let mut init = vec![32u8];
         init.extend(mpint(&rand_biguint(&mut rng, p.bits() - 8)));
+        let mark = buf.len();
         if stream.write_all(&ssh_packet(&init)).is_err() { return false; }
-        return read_msg(stream, buf, 33, timeout).is_some();
+        return read_msg(stream, buf, 33, mark, timeout, kex_reply_ok).is_some();
     }
     let Some(pl) = kex_init_payload(kex, &mut rng) else { return false };
+    let mark = buf.len();
     if stream.write_all(&ssh_packet(&pl)).is_err() { return false; }
-    read_msg(stream, buf, 31, timeout).is_some()
+    read_msg(stream, buf, 31, mark, timeout, kex_reply_ok).is_some()
 }
 // The active downgrade test: one live probe per weak algorithm the server lists (see
 // build_probes). Accepted means a weak session can really be established, which is what an
@@ -1544,48 +1636,80 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
     let ips = parse_targets(targets);
     eprintln!("  {} active downgrade test on {} host(s), port {port}", bold("probing"), ips.len());
     let mut answered = 0;
+    let mut hosts_json: Vec<Value> = Vec::new();
+    let vname = |d: &Down| match d { Down::Completed => "completed", Down::Accepted => "accepted", Down::Refused => "refused", Down::Unknown => "inconclusive" };
     for ip in &ips {
-        let found = match scan_ssh(*ip, port, timeout) { Some((_, f)) => f, None => { println!("\n  {} {} no SSH", bold("host"), bold(&ip.to_string())); continue; } };
+        let found = match scan_ssh(*ip, port, timeout) { Some((_, f)) => f, None => {
+            out!("\n  {} {} no SSH", bold("host"), bold(&ip.to_string()));
+            hosts_json.push(json!({"host": ip.to_string(), "answered": false}));
+            continue; } };
         answered += 1;
         let hostkeys: Vec<String> = found.iter().filter(|(ct, _)| ct == "hostkey").map(|(_, v)| v.clone()).collect();
         let hk = if hostkeys.is_empty() { "ssh-ed25519,rsa-sha2-256,ssh-rsa".to_string() } else { hostkeys.join(",") };
-        println!("\n  {} {}", bold("host"), bold(&ip.to_string()));
-        let probes = build_probes(&found, policy);
+        out!("\n  {} {}", bold("host"), bold(&ip.to_string()));
+        let mut probes = build_probes(&found, policy);
+        // ponytail: at most 32 probes per host; a silent server costs up to two timeouts per
+        // probe, and a hostile KEXINIT can list thousands of weak names
+        let skipped = probes.len().saturating_sub(32);
+        probes.truncate(32);
         if probes.is_empty() {
-            println!("    {} no weak kex/cipher/mac in the offer", paint("ok", "92"));
-            match live_downgrade(*ip, port, "diffie-hellman-group1-sha1", &hk, "3des-cbc", "hmac-md5", timeout) {
-                Down::Refused => println!("    {} weak-only proposal refused (server disconnect)", paint(" refused ", "1;37;42")),
-                Down::Completed => println!("    {} weak-only proposal: the server ran a key exchange with algorithms it never listed",
-                                            paint(" DOWNGRADE ACCEPTED ", "1;37;41")),
+            out!("    {} no weak kex/cipher/mac in the offer", paint("ok", "92"));
+            let wo = live_downgrade(*ip, port, "diffie-hellman-group1-sha1", &hk, "3des-cbc", "hmac-md5", timeout);
+            hosts_json.push(json!({"host": ip.to_string(), "answered": true, "probes": [], "accepted": 0, "completed": 0,
+                "weak_only_proposal": vname(&wo), "note": "the server lists no broken or legacy kex, cipher or MAC"}));
+            match wo {
+                Down::Refused => out!("    {} weak-only proposal refused (server disconnect)", paint(" refused ", "1;37;42")),
+                Down::Completed => {
+                    let listed = ["diffie-hellman-group1-sha1", "3des-cbc", "hmac-md5"].iter().any(|w| found.iter().any(|(_, v)| v == w));
+                    out!("    {} weak-only proposal: the server ran a key exchange with {}", paint(" DOWNGRADE ACCEPTED ", "1;37;41"),
+                             if listed { "diffie-hellman-group1-sha1 / 3des-cbc / hmac-md5" } else { "algorithms it never listed" });
+                }
                 // a server cannot negotiate algorithms it never offered, so silence is not acceptance
-                _ => println!("    {} server stayed silent, but it offers nothing weak, so no downgrade is possible", dim("note")),
+                _ => out!("    {} server stayed silent, but it offers nothing weak, so no downgrade is possible", dim("note")),
             }
             continue;
         }
-        let (total, mut acc, mut done) = (probes.len(), 0, 0);
+        let (total, mut acc, mut done, mut unk) = (probes.len(), 0, 0, 0);
+        let mut probes_json: Vec<Value> = Vec::new();
         for pr in probes {
             let (cat, _, _) = score(policy, pr.ctype, &pr.weak);
-            println!("    {} offers weak {} {} [{}]", paint("!", "91"), pr.ctype, bold(&pr.weak), paint(&cat, cat_fg(&cat)));
+            out!("    {} offers weak {} {} [{}]", paint("!", "91"), pr.ctype, bold(&pr.weak), paint(&cat, cat_fg(&cat)));
             let (Some(k), Some(c), Some(m)) = (pr.kex, pr.cipher, pr.mac) else {
-                println!("      {} cannot build a probe from this offer (a MAC test needs a non-AEAD cipher)", dim("note"));
+                out!("      {} cannot build a probe from this offer (a MAC test needs a non-AEAD cipher)", dim("note"));
+                unk += 1;
+                probes_json.push(json!({"ctype": pr.ctype, "weak": pr.weak, "category": cat, "verdict": "not built"}));
                 continue;
             };
-            match live_downgrade(*ip, port, &k, &hk, &c, &m, timeout) {
-                Down::Completed => { acc += 1; done += 1; println!("      {} {k} / {c} / {m}", paint(" DOWNGRADE ACCEPTED ", "1;37;41")) }
-                Down::Accepted => { acc += 1; println!("      {} {k} / {c} / {m} {}", paint(" DOWNGRADE ACCEPTED ", "1;37;41"), dim("(negotiated, no signed reply)")) }
-                Down::Refused  => println!("      {} {k} / {c} / {m}", paint(" refused ", "1;37;42")),
-                Down::Unknown  => println!("      {} live probe inconclusive", dim("note")),
+            let v = live_downgrade(*ip, port, &k, &hk, &c, &m, timeout);
+            probes_json.push(json!({"ctype": pr.ctype, "weak": pr.weak, "category": cat, "kex": k, "cipher": c, "mac": m, "verdict": vname(&v)}));
+            match v {
+                Down::Completed => { acc += 1; done += 1; out!("      {} {k} / {c} / {m}", paint(" DOWNGRADE ACCEPTED ", "1;37;41")) }
+                Down::Accepted => { acc += 1; out!("      {} {k} / {c} / {m} {}", paint(" DOWNGRADE ACCEPTED ", "1;37;41"), dim("(negotiated, no signed reply)")) }
+                Down::Refused  => out!("      {} {k} / {c} / {m}", paint(" refused ", "1;37;42")),
+                Down::Unknown  => { unk += 1; out!("      {} live probe inconclusive", dim("note")) }
             }
         }
+        let mut tail = String::new();
+        if unk > 0 { tail.push_str(&format!(", {unk} inconclusive")); }
+        if skipped > 0 { tail.push_str(&format!(", {skipped} more not probed (cap 32)")); }
+        hosts_json.push(json!({"host": ip.to_string(), "answered": true, "probes": probes_json, "accepted": acc, "completed": done,
+            "inconclusive": unk, "not_probed": skipped}));
         if acc == 0 {
-            println!("    {} 0 of {total} weak probes accepted", paint("=>", "92"));
+            out!("    {} 0 of {total} weak probes accepted{tail}", paint("=>", if unk == 0 { "92" } else { "93" }));
         } else {
-            println!("    {} {acc} of {total} weak probes accepted; in {done} of them the server completed the key exchange and signed it",
+            out!("    {} {acc} of {total} weak probes accepted; in {done} of them the server completed the key exchange and signed it{tail}",
                      paint("=>", "91"));
         }
     }
-    println!();
-    if answered == 0 { eprintln!("  {} no SSH service answered on {} target(s)", paint("error", "91"), ips.len()); std::process::exit(2); }
+    out!();
+    if answered == 0 {
+        eprintln!("  {} no SSH service answered on {} target(s)", paint("error", "91"), ips.len());
+        json_fail("downgrade", "no SSH service answered", 2);
+    }
+    emit_json(&json!({"command": "downgrade", "port": port,
+        "verdicts": {"completed": "accepted, and the server sent its signed key exchange reply", "accepted": "the server agreed to the weak proposal, no signed reply",
+                     "refused": "disconnect or reset", "inconclusive": "no answer either way"},
+        "hosts": hosts_json}));
 }
 
 // ================= O7: Shor's algorithm (the quantum verdict, demonstrated) =================
@@ -2321,7 +2445,7 @@ fn ai_report_cmd(outdir: &str, use_ai: bool) {
     let (digest, og, os) = build_findings_digest(&recs);
     let (summary, author) = if use_ai {
         let prompt = format!(
-"You are a cybersecurity report writer. Write an executive summary of 3 to 4 plain sentences for a manager, using ONLY the findings below. State the overall grade exactly as given. Mention the worst host and why it is weak. Use the words key exchange, host key, cipher and MAC exactly as the findings label them: Diffie-Hellman and ECDH are key exchanges, not ciphers. Do not recommend specific algorithms, do not write a list, headings or markdown, do not use dash characters. Findings:\n\n{digest}");
+"You are a cybersecurity report writer. Write an executive summary of 3 to 4 plain sentences for a manager, using ONLY the findings below. State the overall grade exactly as given. Mention the worst host and why it is weak. Call each algorithm by the label the findings give it (key exchange, host key, cipher or MAC). Do not recommend specific algorithms, do not write a list, headings or markdown, do not use dash characters. Findings:\n\n{digest}");
         // The summary is only accepted if it agrees with the engine: it must name the computed
         // worst host and must not call another host the worst. One retry, then the template.
         let worst = worst_host(&recs);
@@ -2370,18 +2494,23 @@ fn ai_ask_cmd(question: &str, outdir: &str) {
     // ponytail: the engine's plan is NOT in this prompt; with it, llama3.2:3b named the wrong
     // worst host in 12 of 12 tries. The plan is printed by `report`, the model only answers.
     let prompt = format!(
-"You answer questions about a network's cryptography using ONLY the findings below. Be concise, 2 to 4 plain sentences, no markdown. If the findings do not contain the answer, say so. Do not invent data, do not use dash characters. Diffie-Hellman and ECDH are key exchanges, not ciphers. Findings:\n\n{digest}\n\nQuestion: {question}");
+"You answer questions about a network's cryptography using ONLY the findings below. Be concise, 2 to 4 plain sentences, no markdown. If the findings do not contain the answer, say so. Do not invent data, do not use dash characters. Call each algorithm by the label the findings give it. Findings:\n\n{digest}\n\nQuestion: {question}");
     println!("\n  {} {question}", bold("Q:"));
     eprintln!("  {} asking the local model {} (up to 90s)...", paint("ai", "96"), OLLAMA_MODEL);
     // An answer cannot be verified in general, but a claim about the worst host can: a wrong
     // one is asked again once, and if it is still wrong the engine answers instead.
     let hosts: BTreeSet<String> = recs.iter().map(|r| r.host.clone()).collect();
     let worst = worst_host(&recs);
-    let wrong = |t: &str| worst.as_ref().map_or(false, |(w, _)| contradicts_worst(t, w, &hosts));
+    let wrong = |t: &str| worst.as_ref().map_or(false, |(w, _)| contradicts_worst(t, w, &hosts) && !mentions(t, w));
     let first = ollama_generate(&prompt).map(|t| clean_model_text(&t));
     let reached = first.is_some();
+    let mut retry_wrong = false;
     let answer = match first {
-        Some(t) if wrong(&t) => ollama_generate(&prompt).map(|t| clean_model_text(&t)).filter(|t| !wrong(t)).ok_or(()),
+        Some(t) if wrong(&t) => match ollama_generate(&prompt).map(|t| clean_model_text(&t)) {
+            Some(t2) if !wrong(&t2) => Ok(t2),
+            Some(_) => { retry_wrong = true; Err(()) }
+            None => Err(()),
+        },
         Some(t) => Ok(t),
         None => Err(()),
     };
@@ -2391,7 +2520,8 @@ fn ai_ask_cmd(question: &str, outdir: &str) {
             let (w, ws) = worst.clone().unwrap_or_default();
             let n = recs.iter().filter(|r| r.host == w && r.category == "broken").count();
             println!("  {} The worst host is {w}, grade {} ({ws:.0}/100), with {n} broken parameter(s).", bold("A:"), grade(ws).0);
-            println!("  {} the model named the wrong worst host twice, so the engine answered\n", paint("check", "93"));
+            println!("  {} {}, so the engine answered\n", paint("check", "93"),
+                     if retry_wrong { "the model named the wrong worst host twice" } else { "the model named the wrong worst host and the retry got no answer" });
         }
         (Err(()), false) => {
             eprintln!("  {} local model not reachable (start it with `ollama serve`, then `ollama pull {}`)", paint("note", "93"), OLLAMA_MODEL);
@@ -2445,6 +2575,7 @@ fn usage() -> ! {
          USAGE:\n  \
          cryptocensus scan      --targets <IPs|CIDR> [--port 22] [--out ./results] [--concurrency 256] [--timeout-ms 1500] [--policy FILE] [--fail-under A|B|C|D] [--append] [--no-color]\n  \
          cryptocensus tls       --targets <IPs|CIDR> --port 4443 [--out ./results] [--append]\n  \
+         (scan, tls, downgrade, fix and diff take --json: one JSON document on stdout, the human view on stderr)\n  \
          cryptocensus fix       --targets <IPs|CIDR> [--port 22] [--out ./results]     post-quantum sshd hardening + the grade it reaches\n  \
          cryptocensus diff      <before.json> <after.json> [--fail-on-regression]      drift between two scans\n  \
          cryptocensus local     [--out ./results]                                      host configuration (sshd, host keys, openssl)\n  \
@@ -2495,6 +2626,7 @@ fn num_flag<T: std::str::FromStr + PartialOrd + Copy + std::fmt::Display>(args: 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--no-color") { USE_COLOR.store(0, Ordering::Relaxed); }
+    if args.iter().any(|a| a == "--json") { JSON_OUT.store(1, Ordering::Relaxed); USE_COLOR.store(0, Ordering::Relaxed); }
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
     let port: u16 = num_flag(&args, "--port", 22u16, 1, 65535);
     let timeout = Duration::from_millis(num_flag(&args, "--timeout-ms", 1500u64, 50, 600_000));
@@ -2521,7 +2653,7 @@ fn main() {
             // the previous results, so an offline or penalised host can never pass the gate.
             if gate_decision(&recs, None) == Gate::NoData {
                 eprintln!("  {} no SSH service answered on {} target(s), port {port}; nothing graded, previous results kept", paint("error", "91"), ips.len());
-                std::process::exit(2);
+                json_fail("scan", "no SSH service answered; nothing graded, previous results kept", 2);
             }
             let recs = maybe_append(&args, recs, outdir);
             let stamp = now_iso();
@@ -2531,8 +2663,18 @@ fn main() {
                       recs.iter().map(|r| r.host.clone()).collect::<BTreeSet<_>>().len(),
                       paint(&format!("{:.3}s", t0.elapsed().as_secs_f64()), "96"));
             print_summary(&recs, &banners);
-            println!("  {} {outdir}/inventory.json | {outdir}/cbom.json | {outdir}/report.html | {outdir}/cryptocensus.sarif",
+            out!("  {} {outdir}/inventory.json | {outdir}/cbom.json | {outdir}/report.html | {outdir}/cryptocensus.sarif",
                      dim("written:"));
+            let mut doc = inventory_json(&recs);
+            doc["command"] = json!("scan");
+            doc["port"] = json!(port);
+            doc["files"] = json!({"inventory": format!("{outdir}/inventory.json"), "cbom": format!("{outdir}/cbom.json"),
+                                  "report": format!("{outdir}/report.html"), "sarif": format!("{outdir}/cryptocensus.sarif")});
+            doc["gate"] = match &gate {
+                Some(t) => json!({"threshold": t, "pass": matches!(gate_decision(&recs, Some(t)), Gate::Pass(_))}),
+                None => Value::Null,
+            };
+            emit_json(&doc);
             if let Some(thr) = gate {
                 match gate_decision(&recs, Some(&thr)) {
                     Gate::Fail(og) => {
@@ -2561,7 +2703,7 @@ fn main() {
             let recs = tls_scan(&ips, tport, timeout, workers, &policy);
             if gate_decision(&recs, None) == Gate::NoData {
                 eprintln!("  {} no TLS 1.3 service answered on {} target(s), port {tport}; nothing graded, previous results kept", paint("error", "91"), ips.len());
-                std::process::exit(2);
+                json_fail("tls", "no TLS 1.3 service answered; nothing graded, previous results kept", 2);
             }
             let stamp = now_iso();
             let merged = maybe_append(&args, recs.clone(), outdir);
@@ -2570,11 +2712,20 @@ fn main() {
                       paint(&format!("{:.3}s", t0.elapsed().as_secs_f64()), "96"));
             print_summary(&merged, &BTreeMap::new());
             if merged.len() > recs.len() {
-                println!("  {} {outdir}/cbom.json now holds SSH and TLS: {} parameters", dim("appended:"), merged.len());
+                let what = if merged.iter().any(|r| r.service == "ssh") { "SSH and TLS" } else { "TLS" };
+                out!("  {} {outdir}/cbom.json now holds {what}: {} parameters", dim("appended:"), merged.len());
             }
+            let mut doc = inventory_json(&merged);
+            doc["command"] = json!("tls");
+            doc["port"] = json!(tport);
+            doc["endpoints"] = json!(recs.iter().map(|r| json!({"host": r.host, "port": r.port, "group": r.value,
+                "category": r.category, "post_quantum": r.category == "pq-ready"})).collect::<Vec<_>>());
+            doc["appended"] = json!(merged.len() > recs.len());
+            doc["files"] = json!({"inventory": format!("{outdir}/inventory.json"), "cbom": format!("{outdir}/cbom.json")});
+            emit_json(&doc);
             for r in &recs {
                 let verdict = if r.category == "pq-ready" { paint("POST-QUANTUM", "92") } else { paint("classical, quantum-vulnerable", "93") };
-                println!("  {}:{} negotiates {} -> {}", r.host, r.port, bold(&r.value), verdict);
+                out!("  {}:{} negotiates {} -> {}", r.host, r.port, bold(&r.value), verdict);
             }
         }
         "fix" => {
