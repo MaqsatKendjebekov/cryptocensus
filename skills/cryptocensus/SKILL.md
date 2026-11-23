@@ -44,7 +44,7 @@ cryptocensus selftest --no-color | tail -1     # must print: self-test passed: N
 ```
 
 If the binary is missing, build it from the repository:
-`git clone https://github.com/MaqsatKendjebekov/cryptocensus && cd cryptocensus && cargo build --release`
+`git clone https://github.com/cryptocensus/cryptocensus && cd cryptocensus && cargo build --release`
 (about 20 seconds, Rust stable).
 
 Targets are IPv4 addresses or CIDR ranges from /16 to /32, comma separated.

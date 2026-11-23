@@ -1,9 +1,9 @@
 [package]
 name = "cryptocensus"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 description = "Native crypto-posture scanner: SSH and TLS inventory with post-quantum readiness scoring, live proof and CycloneDX CBOM"
-repository = "https://github.com/MaqsatKendjebekov/cryptocensus"
+repository = "https://github.com/cryptocensus/cryptocensus"
 
 [dependencies]
 serde_json = "1"

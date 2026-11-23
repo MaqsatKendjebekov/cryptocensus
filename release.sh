@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-REPO=MaqsatKendjebekov/cryptocensus
+REPO=cryptocensus/cryptocensus
 D=target/dist
 rm -rf "$D"; mkdir -p "$D"
 CACHE=(-v cc-cargo-registry:/usr/local/cargo/registry)
@@ -48,7 +48,7 @@ for a in amd64:x86_64 arm64:aarch64; do
 Package: cryptocensus
 Version: $V
 Architecture: ${a%%:*}
-Maintainer: Maksat Kendjebekov <MaqsatKendjebekov@users.noreply.github.com>
+Maintainer: CryptoCensus <cryptocensus@users.noreply.github.com>
 Section: net
 Priority: optional
 Installed-Size: $(du -sk "$P/usr" | cut -f1)
@@ -82,7 +82,7 @@ package() { install -Dm755 "\$srcdir/cryptocensus" "\$pkgdir/usr/bin/cryptocensu
 EOF
 U="https://github.com/$REPO/releases/download/v\$pkgver"
 cat > "$P/aur/PKGBUILD" <<EOF
-# Maintainer: Maksat Kendjebekov <MaqsatKendjebekov@users.noreply.github.com>
+# Maintainer: CryptoCensus <cryptocensus@users.noreply.github.com>
 pkgname=cryptocensus-bin
 pkgver=$V
 pkgrel=1

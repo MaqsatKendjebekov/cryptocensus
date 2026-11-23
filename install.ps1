@@ -1,12 +1,12 @@
 # CryptoCensus installer for Windows. One command in PowerShell, no admin rights:
-#   irm https://raw.githubusercontent.com/MaqsatKendjebekov/cryptocensus/master/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/cryptocensus/cryptocensus/master/install.ps1 | iex
 # Downloads the Windows release, checks its SHA-256 against the release's SHA256SUMS, runs
 # the binary's self-test, and only then installs it to %LOCALAPPDATA%\cryptocensus and adds
 # that folder to your user PATH. It runs in its own scope, so your session's variables and
 # settings are left alone.
 & {
     $ErrorActionPreference = 'Stop'
-    $repo  = 'MaqsatKendjebekov/cryptocensus'
+    $repo  = 'cryptocensus/cryptocensus'
     $asset = 'cryptocensus-x86_64-pc-windows-gnu.zip'
     $base  = "https://github.com/$repo/releases/latest/download"
     $dir   = Join-Path $env:LOCALAPPDATA 'cryptocensus'

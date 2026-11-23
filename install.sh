@@ -1,13 +1,13 @@
 #!/bin/sh
 # CryptoCensus installer. One command, no sudo:
-#   curl -fsSL https://raw.githubusercontent.com/MaqsatKendjebekov/cryptocensus/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/cryptocensus/cryptocensus/master/install.sh | sh
 # It downloads the release binary for this OS and CPU, checks its SHA-256 against the
 # release's SHA256SUMS, runs the binary's self-test, and only then installs it to ~/.local/bin.
 # Options (environment): CRYPTOCENSUS_BIN_DIR (default ~/.local/bin),
 # CRYPTOCENSUS_VERSION (default latest, or a release such as 1.1.0).
 set -eu
 
-REPO="MaqsatKendjebekov/cryptocensus"
+REPO="cryptocensus/cryptocensus"
 BIN_DIR="${CRYPTOCENSUS_BIN_DIR:-$HOME/.local/bin}"
 VERSION="${CRYPTOCENSUS_VERSION:-latest}"
 SRC="cargo install --locked --git https://github.com/$REPO"

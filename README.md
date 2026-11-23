@@ -10,37 +10,37 @@ write the report with a local model. One Rust binary, dependency-light.
 macOS or Linux (any distribution), no sudo:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/MaqsatKendjebekov/cryptocensus/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cryptocensus/cryptocensus/master/install.sh | sh
 ```
 
 Homebrew (macOS, Linux):
 
 ```sh
-brew install maqsatkendjebekov/tap/cryptocensus
+brew install cryptocensus/tap/cryptocensus
 ```
 
 Debian, Ubuntu, Kali (apt):
 
 ```sh
-f=$(mktemp --suffix=.deb) && curl -fsSLo "$f" https://github.com/MaqsatKendjebekov/cryptocensus/releases/latest/download/cryptocensus_$(dpkg --print-architecture).deb && chmod 644 "$f" && sudo apt install "$f"
+f=$(mktemp --suffix=.deb) && curl -fsSLo "$f" https://github.com/cryptocensus/cryptocensus/releases/latest/download/cryptocensus_$(dpkg --print-architecture).deb && chmod 644 "$f" && sudo apt install "$f"
 ```
 
 Arch Linux on x86_64 (pacman; on aarch64 use the first command or `packaging/aur`):
 
 ```sh
-f=$(mktemp --suffix=.pkg.tar.zst) && curl -fsSLo "$f" https://github.com/MaqsatKendjebekov/cryptocensus/releases/latest/download/cryptocensus-x86_64.pkg.tar.zst && sudo pacman -U "$f"
+f=$(mktemp --suffix=.pkg.tar.zst) && curl -fsSLo "$f" https://github.com/cryptocensus/cryptocensus/releases/latest/download/cryptocensus-x86_64.pkg.tar.zst && sudo pacman -U "$f"
 ```
 
 Windows (PowerShell, no admin):
 
 ```powershell
-irm https://raw.githubusercontent.com/MaqsatKendjebekov/cryptocensus/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/cryptocensus/cryptocensus/master/install.ps1 | iex
 ```
 
 Anywhere with Rust:
 
 ```sh
-cargo install --git https://github.com/MaqsatKendjebekov/cryptocensus
+cargo install --git https://github.com/cryptocensus/cryptocensus
 ```
 
 The two install scripts check the SHA-256 of the download against the release's
@@ -112,7 +112,7 @@ scanned from a Mac:
 ## Build from source
 
 ```sh
-git clone https://github.com/MaqsatKendjebekov/cryptocensus && cd cryptocensus
+git clone https://github.com/cryptocensus/cryptocensus && cd cryptocensus
 cargo build --release
 ./target/release/cryptocensus selftest
 ```
