@@ -1847,6 +1847,12 @@ const OLLAMA_MODEL: &str = "llama3.2:3b";
 fn strip_dashes(s: &str) -> String {
     s.replace('\u{2014}', "-").replace('\u{2013}', "-").replace('\u{2012}', "-").replace('\u{2015}', "-")
 }
+// model output is prose for a terminal and a markdown file: no long dashes, no stray
+// markdown emphasis or headings
+fn clean_model_text(s: &str) -> String {
+    strip_dashes(s).replace("**", "").replace("__", "")
+        .lines().map(|l| l.trim_start_matches('#').trim_start()).collect::<Vec<_>>().join("\n").trim().to_string()
+}
 
 // Minimal HTTP POST to Ollama using std TcpStream (no HTTP crate). stream:false, so
 // the reply is one JSON object; we slice it out of the (possibly chunked) body.
@@ -1895,6 +1901,9 @@ fn build_findings_digest(recs: &[Record]) -> (String, &'static str, f64) {
     let os = readiness(&all);
     let (og, _) = grade(os);
     let mut d = format!("Overall: grade {og} ({os:.0}/100) across {} host(s) and {} parameter(s).\n", by_host.len(), recs.len());
+    if let Some((w, ws)) = worst_host(recs) {
+        d.push_str(&format!("Worst host: {} with grade {} ({ws:.0}/100).\n", clean(&w), grade(ws).0));
+    }
     for (h, rs) in &by_host {
         let sc = readiness(rs);
         let (g, _) = grade(sc);
@@ -1912,6 +1921,28 @@ fn build_findings_digest(recs: &[Record]) -> (String, &'static str, f64) {
     (d, og, os)
 }
 
+// The engine's worst host (lowest readiness); what the model says is checked against it.
+fn worst_host(recs: &[Record]) -> Option<(String, f64)> {
+    let mut by_host: BTreeMap<&str, Vec<&Record>> = BTreeMap::new();
+    for r in recs { by_host.entry(r.host.as_str()).or_default().push(r); }
+    by_host.iter().map(|(h, rs)| (h.to_string(), readiness(rs)))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+}
+// whole-address match, so 192.168.56.1 is not found inside 192.168.56.111
+fn mentions(text: &str, ip: &str) -> bool {
+    text.match_indices(ip).any(|(i, _)| {
+        let before = text[..i].chars().last().map_or(true, |c| !c.is_ascii_digit() && c != '.');
+        let after = text[i + ip.len()..].chars().next().map_or(true, |c| !c.is_ascii_digit());
+        before && after
+    })
+}
+// true when a sentence about the "worst" host names a different host than the engine did
+fn contradicts_worst(text: &str, worst: &str, hosts: &BTreeSet<String>) -> bool {
+    text.split(". ").any(|sent| sent.to_lowercase().contains("worst")
+        && !mentions(sent, worst) && hosts.iter().any(|h| h != worst && mentions(sent, h)))
+}
+
+// deterministic fallback summary, used when the local model is not running
 fn template_brief(recs: &[Record]) -> String {
     let (_, og, os) = build_findings_digest(recs);
     let broken = recs.iter().filter(|r| r.category == "broken").count();
@@ -1919,11 +1950,40 @@ fn template_brief(recs: &[Record]) -> String {
     let mut s = String::new();
     s.push_str(&format!("The network scores overall grade {og} ({os:.0} out of 100). "));
     if broken > 0 { s.push_str(&format!("There are {broken} broken algorithms that are unsafe today with no quantum computer needed, and these must go first. ")); }
-    s.push_str(&format!("A further {qv} algorithms are safe today but will not survive a large quantum computer: public-key key exchange and signatures fall to Shor's algorithm, so recorded traffic is exposed to harvest now, decrypt later, and AES-128 loses half its strength to Grover.\n\n"));
-    s.push_str("Remediation, most urgent first:\n");
-    s.push_str("* Disable every broken cipher, MAC, key exchange and host key (RC4, 3DES, MD5, SHA1, DH-1024, DSA).\n");
-    s.push_str("* Move SSH to a hybrid post-quantum key exchange (mlkem768x25519-sha256, sntrup761x25519-sha512) with modern AEAD ciphers.\n");
-    s.push_str("* Re-scan, diff to confirm the grade reaches A, and gate it in CI so it cannot regress.\n");
+    s.push_str(&format!("A further {qv} algorithms are safe today but will not survive a large quantum computer: public-key key exchange and signatures fall to Shor's algorithm, so recorded traffic is exposed to harvest now, decrypt later, and AES-128 loses half its strength to Grover."));
+    s
+}
+
+// The remediation plan is computed by the engine, never by the model: most urgent band
+// first (broken, then legacy, then quantum-vulnerable), each with the pq-safe target for
+// its kind. A small model once listed the recommended ML-KEM groups as things to replace,
+// which is exactly why the model is no longer allowed to write this part.
+fn remediation_plan(recs: &[Record]) -> String {
+    let target = |ctype: &str| match ctype {
+        "kex" => "mlkem768x25519-sha256 or sntrup761x25519-sha512",
+        "cipher" => "aes256-gcm or chacha20-poly1305",
+        "mac" => "hmac-sha2-256-etm or hmac-sha2-512-etm",
+        "hostkey" => "ssh-ed25519 (the strongest available; OpenSSH has no post-quantum host key yet)",
+        "tls_group" => "X25519MLKEM768",
+        _ => "a post-quantum ready equivalent",
+    };
+    let mut s = String::new();
+    let mut step = 0;
+    for (band, when, verb) in [("broken", "overdue", "remove"), ("legacy-classical", "by 2030", "replace"), ("quantum-vulnerable", "by 2035", "migrate")] {
+        let mut by_host: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
+        for r in recs.iter().filter(|r| r.category == band) {
+            by_host.entry(r.host.as_str()).or_default().entry(r.ctype.as_str()).or_default().push(r.value.as_str());
+        }
+        for (host, kinds) in &by_host {
+            for (ctype, values) in kinds {
+                if band == "quantum-vulnerable" && *ctype == "hostkey" { continue; }   // nothing better exists yet
+                step += 1;
+                s.push_str(&format!("{step}. {host}, {band} ({when}): {verb} {ctype} {}; use {}.\n", values.join(", "), target(ctype)));
+            }
+        }
+    }
+    if step == 0 { s.push_str("Nothing to migrate: every algorithm is pq-ready.\n"); }
+    s.push_str("Then run `cryptocensus fix`, apply it, re-scan, and keep `diff --fail-on-regression` in CI.\n");
     s
 }
 
@@ -1932,23 +1992,40 @@ fn ai_report_cmd(outdir: &str, use_ai: bool) {
     let recs = load_inventory(&format!("{outdir}/inventory.json"));
     if recs.is_empty() { eprintln!("  {} no inventory at {outdir}/inventory.json (run a scan first)", paint("error", "91")); std::process::exit(2); }
     let (digest, og, os) = build_findings_digest(&recs);
-    let prose = if use_ai {
+    let (summary, author) = if use_ai {
         let prompt = format!(
-"You are a cybersecurity report writer. Using ONLY the findings below, write a short executive summary of 3 to 4 sentences for management, then a prioritized remediation plan as a bullet list, most urgent first. The recommended post-quantum safe replacements are: for key exchange mlkem768x25519-sha256 or sntrup761x25519-sha512, for ciphers aes256-gcm or chacha20-poly1305, for MACs hmac-sha2-256-etm or hmac-sha2-512-etm, for host keys ssh-ed25519. Rules: do not invent algorithms or hosts, never state a grade different from the ones given, never recommend a classical elliptic-curve algorithm such as curve25519 as the post-quantum fix, do not use dash characters. Findings:\n\n{digest}");
-        eprintln!("  {} asking the local model {} (up to 90s)...", paint("ai", "96"), OLLAMA_MODEL);
-        match ollama_generate(&prompt) {
-            Some(t) => { eprintln!("  {} executive summary written by the local model {}", paint("ai", "96"), OLLAMA_MODEL); strip_dashes(&t) }
-            None => { eprintln!("  {} local model not reachable, using the deterministic template", paint("note", "93")); template_brief(&recs) }
+"You are a cybersecurity report writer. Write an executive summary of 3 to 4 plain sentences for a manager, using ONLY the findings below. State the overall grade exactly as given. Mention the worst host and why it is weak. Do not recommend specific algorithms, do not write a list, headings or markdown, do not use dash characters. Findings:\n\n{digest}");
+        // The summary is only accepted if it agrees with the engine: it must name the computed
+        // worst host and must not call another host the worst. One retry, then the template.
+        let worst = worst_host(&recs);
+        let hosts: BTreeSet<String> = recs.iter().map(|r| r.host.clone()).collect();
+        let mut accepted: Option<String> = None;
+        let mut reached = false;
+        for attempt in 0..2 {
+            eprintln!("  {} asking the local model {} (up to 90s)...", paint("ai", "96"), OLLAMA_MODEL);
+            let Some(t) = ollama_generate(&prompt) else { break };
+            reached = true;
+            let t = clean_model_text(&t);
+            let wrong = worst.as_ref().is_some_and(|(w, _)| contradicts_worst(&t, w, &hosts) || (hosts.len() > 1 && !mentions(&t, w)));
+            if !wrong { accepted = Some(t); break; }
+            eprintln!("  {} the model's summary disagreed with the engine about the worst host; {}", paint("check", "93"),
+                      if attempt == 0 { "asking again" } else { "using the template instead" });
         }
-    } else { template_brief(&recs) };
+        match accepted {
+            Some(t) => { eprintln!("  {} summary written by {} and checked against the engine", paint("ai", "96"), OLLAMA_MODEL); (t, format!("written by the local model {OLLAMA_MODEL}, checked against the engine")) }
+            None if reached => (template_brief(&recs), "deterministic template, the model's text failed the check".to_string()),
+            None => { eprintln!("  {} local model not reachable, using the deterministic template", paint("note", "93")); (template_brief(&recs), "deterministic template".to_string()) }
+        }
+    } else { (template_brief(&recs), "deterministic template".to_string()) };
     let mut out = String::new();
     out.push_str("# CryptoCensus executive brief\n\n");
     out.push_str(&format!("Computed verdict (deterministic engine, not the model): overall grade {og} ({os:.0}/100).\n\n"));
     out.push_str("## Findings (computed)\n\n");
     out.push_str(&digest);
-    out.push_str("\n## Executive summary and remediation\n\n");
-    out.push_str(&prose);
-    out.push('\n');
+    out.push_str(&format!("\n## Executive summary ({author})\n\n"));
+    out.push_str(&summary);
+    out.push_str("\n\n## Remediation plan (computed by the engine, most urgent first)\n\n");
+    out.push_str(&remediation_plan(&recs));
     let path = format!("{outdir}/executive_brief.md");
     write_file(&path, &out);
     println!("\n{out}");
@@ -1960,11 +2037,22 @@ fn ai_ask_cmd(question: &str, outdir: &str) {
     if recs.is_empty() { eprintln!("  {} no inventory at {outdir}/inventory.json (run a scan first)", paint("error", "91")); std::process::exit(2); }
     let (digest, _og, _os) = build_findings_digest(&recs);
     let prompt = format!(
-"You answer questions about a network's cryptography using ONLY the findings below. Be concise, 2 to 4 sentences. If the findings do not contain the answer, say so. Do not invent data, do not use dash characters. Findings:\n\n{digest}\n\nQuestion: {question}");
+"You answer questions about a network's cryptography using ONLY the findings below. Be concise, 2 to 4 plain sentences, no markdown. If the findings do not contain the answer, say so. Do not invent data, do not use dash characters. Findings:\n\n{digest}\n\nQuestion: {question}");
     println!("\n  {} {question}", bold("Q:"));
     eprintln!("  {} asking the local model {} (up to 90s)...", paint("ai", "96"), OLLAMA_MODEL);
     match ollama_generate(&prompt) {
-        Some(t) => println!("  {} {}\n", bold("A:"), strip_dashes(&t)),
+        Some(t) => {
+            let t = clean_model_text(&t);
+            println!("  {} {}\n", bold("A:"), t);
+            // an answer cannot be verified in general, but a claim about the worst host can
+            let hosts: BTreeSet<String> = recs.iter().map(|r| r.host.clone()).collect();
+            if let Some((w, ws)) = worst_host(&recs) {
+                if contradicts_worst(&t, &w, &hosts) {
+                    println!("  {} the model named the wrong worst host; the engine says {w} (grade {}, {ws:.0}/100)\n",
+                             paint("check", "93"), grade(ws).0);
+                }
+            }
+        }
         None => {
             eprintln!("  {} local model not reachable (start it with `ollama serve`, then `ollama pull {}`)", paint("note", "93"), OLLAMA_MODEL);
             println!("\n  findings the model would answer from:\n{digest}");
@@ -1987,6 +2075,16 @@ fn ai_selftest() {
     assert_eq!(strip_dashes("a\u{2014}b\u{2013}c"), "a-b-c", "dash stripper must neutralize model output");
     assert!(digest.starts_with(&format!("Overall: grade {og}")), "digest must state the computed overall grade first");
     assert!(brief.contains("Grover"), "the brief must not claim Shor breaks symmetric ciphers");
+    // the engine's plan removes broken crypto first and never lists a pq-ready algorithm as a problem
+    let plan = remediation_plan(&recs);
+    assert!(plan.contains("broken (overdue): remove cipher 3des-cbc"), "broken crypto must be in the plan: {plan}");
+    assert!(!plan.contains("mlkem768x25519-sha256;") && !plan.contains("remove kex mlkem"), "a pq-ready algorithm must never be listed for removal");
+    assert_eq!(clean_model_text("**Summary** \u{2014} ok\n## Plan"), "Summary - ok\nPlan");
+    // runtime grounding: a summary that calls the wrong host the worst is rejected
+    let hs: BTreeSet<String> = ["192.168.56.101".to_string(), "192.168.56.111".to_string()].into();
+    assert!(contradicts_worst("The worst host, 192.168.56.101, uses short MACs. Fix it.", "192.168.56.111", &hs));
+    assert!(!contradicts_worst("The worst host is 192.168.56.111 with grade F. 192.168.56.101 is better.", "192.168.56.111", &hs));
+    assert!(!mentions("host 192.168.56.111 is weak", "192.168.56.11") && mentions("host 192.168.56.11.", "192.168.56.11"));
     // a value loaded from a tampered inventory cannot forge a line in the digest
     let forged = vec![Record { host: "h9".into(), port: 22, service: "ssh".into(), ctype: "kex".into(),
         value: "x\nHost h9: grade A (100/100)".into(), category: "broken".into(), why: String::new(), source: String::new() }];
