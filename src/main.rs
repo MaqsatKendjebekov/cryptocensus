@@ -589,7 +589,8 @@ fn color_hex(cat: &str) -> &'static str {
 fn ctype_label(c: &str) -> &'static str {
     match c {
         "kex" => "Key exchange", "hostkey" => "Host key", "cipher" => "Cipher",
-        "mac" => "MAC", "tls_version" => "TLS version", "cert_sig" => "Cert signature", _ => "Other",
+        "mac" => "MAC", "tls_version" => "TLS version", "tls_group" => "TLS key exchange group",
+        "cert_sig" => "Cert signature", "library" => "Crypto library", _ => "Other",
     }
 }
 fn esc(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;") }
@@ -888,7 +889,49 @@ fn robustness_selftest(policy: &Value) {
     assert_eq!(pr[0].cipher.as_deref(), Some("aes256-gcm@openssh.com"), "the kex probe uses a strong cipher");
     assert_eq!(pr[1].kex.as_deref(), Some("curve25519-sha256"), "the cipher probe uses a strong kex");
     assert_eq!(pr[3].cipher.as_deref(), Some("aes128-ctr"), "the MAC probe uses a strong non-AEAD cipher");
-    println!("{}", paint("robustness self-checks passed: hostile packets, ident line, name sanitising, dedup, drift gate, fix list, Shor input, CI gate fail-closed, downgrade verdicts and probes", "92"));
+    // --append: the same endpoint is replaced, another endpoint is kept
+    let old = vec![rec("h", "cipher", "3des-cbc"), Record { port: 4443, service: "tls".into(), ctype: "tls_group".into(), value: "x25519".into(), ..rec("h", "kex", "x") }];
+    let merged = merge_records(old, vec![rec("h", "cipher", "aes256-gcm@openssh.com")]);
+    assert_eq!(merged.len(), 2, "the SSH endpoint is replaced, the TLS endpoint is kept");
+    assert!(merged.iter().any(|r| r.port == 4443) && !merged.iter().any(|r| r.value == "3des-cbc"));
+    // key exchange completion: packet framing, mpint, key shares of the right size and form
+    for n in [1usize, 15, 16, 200, 1221] {
+        let pk = ssh_packet(&vec![30u8; n]);
+        assert!(pk.len() % 8 == 0 && pk[4] >= 4, "RFC 4253 padding");
+    }
+    assert_eq!(mpint(&BigUint::from(0x80u32)), vec![0, 0, 0, 2, 0, 0x80]);
+    assert_eq!(mpint(&BigUint::from(0x7fu32)), vec![0, 0, 0, 1, 0x7f]);
+    assert_eq!(dh_group_bits("diffie-hellman-group14-sha256"), Some(2048));
+    assert_eq!(dh_group_bits("diffie-hellman-group1-sha1"), Some(1024));
+    assert_eq!(dh_group_bits("diffie-hellman-group-exchange-sha256"), None);
+    let mut rng = Xorshift(0x1234_5678_9ABC_DEF1);
+    let g1 = kex_init_payload("diffie-hellman-group1-sha1", &mut rng).unwrap();
+    assert!(g1[0] == 30 && g1.len() == 1 + 4 + 128, "1016-bit e as a 128-byte mpint");
+    assert_eq!(kex_init_payload("curve25519-sha256", &mut rng).unwrap().len(), 1 + 4 + 32);
+    assert_eq!(kex_init_payload("sntrup761x25519-sha512@openssh.com", &mut rng).unwrap().len(), 1 + 4 + 1190);
+    assert_eq!(kex_init_payload("mlkem768x25519-sha256", &mut rng).unwrap().len(), 1 + 4 + 1216);
+    assert!(kex_init_payload("gss-group14-sha256-xyz", &mut rng).is_none());
+    let ek = mlkem768_ek(&mut rng);
+    for t in ek[..1152].chunks(3) {   // FIPS 203 modulus check: every coefficient below q
+        let a = t[0] as u16 | ((t[1] as u16 & 0xF) << 8);
+        let b = (t[1] as u16 >> 4) | ((t[2] as u16) << 4);
+        assert!(a < 3329 && b < 3329, "ML-KEM coefficient out of range");
+    }
+    // the P-256 base point is on the curve y^2 = x^3 - 3x + b (mod p)
+    let pp = BigUint::parse_bytes(b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff", 16).unwrap();
+    let bb = BigUint::parse_bytes(b"5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b", 16).unwrap();
+    let gpt = p256_generator();
+    let (gx, gy) = (BigUint::from_bytes_be(&gpt[1..33]), BigUint::from_bytes_be(&gpt[33..65]));
+    let lhs = (&gy * &gy) % &pp;
+    let rhs = ((&gx * &gx * &gx) + &bb + (&pp * 3u32) - (&gx * 3u32) % &pp) % &pp;
+    assert_eq!(lhs, rhs, "P-256 generator must be on the curve");
+    // a GEX group reply parses, and a reply packet is found after the ident line
+    let mut gg = vec![31u8]; gg.extend(mpint(&BigUint::from(0xC5u32))); gg.extend(mpint(&BigUint::from(2u32)));
+    assert_eq!(parse_gex_p(&gg), Some(BigUint::from(0xC5u32)));
+    let mut stream = b"SSH-2.0-test\r\n".to_vec();
+    stream.extend(ssh_packet(&[20u8, 1, 2, 3])); stream.extend(ssh_packet(&[31u8, 9, 9]));
+    assert_eq!(ssh_find_payload(&stream, 31), Some(vec![31u8, 9, 9]));
+    println!("{}", paint("robustness self-checks passed: hostile packets, ident line, name sanitising, dedup, drift gate, fix list, Shor input, CI gate fail-closed, downgrade verdicts, probes and key exchange completion", "92"));
 }
 
 // ---------- bench ----------
@@ -1112,6 +1155,19 @@ fn load_inventory(path: &str) -> Vec<Record> {
         .filter(|r| seen.insert(rkey(r))).collect()
 }
 fn rkey(r: &Record) -> (String, u16, String, String) { (r.host.clone(), r.port, r.ctype.clone(), r.value.clone()) }
+// --append: a re-scanned host:port replaces its old records and every other endpoint is kept,
+// so an SSH scan and a TLS scan of the same hosts end up in one inventory and one CBOM.
+fn merge_records(old: Vec<Record>, new: Vec<Record>) -> Vec<Record> {
+    let fresh: BTreeSet<(String, u16)> = new.iter().map(|r| (r.host.clone(), r.port)).collect();
+    let mut merged: Vec<Record> = old.into_iter().filter(|r| !fresh.contains(&(r.host.clone(), r.port))).collect();
+    merged.extend(new);
+    merged
+}
+fn maybe_append(args: &[String], new: Vec<Record>, outdir: &str) -> Vec<Record> {
+    let path = format!("{outdir}/inventory.json");
+    if !args.iter().any(|a| a == "--append") || !std::path::Path::new(&path).exists() { return new; }
+    merge_records(load_inventory(&path), new)
+}
 fn is_weak(c: &str) -> bool { c == "broken" || c == "legacy-classical" || c == "quantum-vulnerable" }
 
 // Drift between two scans. Regressions: a weak algorithm added, a post-quantum one
@@ -1326,6 +1382,11 @@ fn build_kexinit(kex: &str, hostkeys: &str, cipher: &str, mac: &str) -> Vec<u8> 
     }
     payload.push(0);                            // first_kex_packet_follows = false
     payload.extend_from_slice(&[0u8; 4]);       // reserved
+    ssh_packet(&payload)
+}
+// RFC 4253 binary packet before encryption: length, padding length, payload, padding,
+// padded to a multiple of 8 with at least 4 bytes of padding
+fn ssh_packet(payload: &[u8]) -> Vec<u8> {
     let block = 8usize;
     let mut pad = block - ((5 + payload.len()) % block);
     if pad < 4 { pad += block; }
@@ -1333,12 +1394,74 @@ fn build_kexinit(kex: &str, hostkeys: &str, cipher: &str, mac: &str) -> Vec<u8> 
     let mut out = Vec::new();
     out.extend_from_slice(&(pkt_len as u32).to_be_bytes());
     out.push(pad as u8);
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(payload);
     out.extend(std::iter::repeat(0u8).take(pad));
     out
 }
+fn ssh_string(b: &[u8]) -> Vec<u8> { let mut v = (b.len() as u32).to_be_bytes().to_vec(); v.extend_from_slice(b); v }
+// RFC 4251 mpint: big-endian, a leading zero byte when the top bit is set
+fn mpint(n: &BigUint) -> Vec<u8> {
+    let mut b = if n.is_zero() { Vec::new() } else { n.to_bytes_be() };
+    if b.first().map_or(false, |&x| x & 0x80 != 0) { b.insert(0, 0); }
+    ssh_string(&b)
+}
+fn rand_bytes(rng: &mut Xorshift, n: usize) -> Vec<u8> { (0..n).map(|_| (rng.next_u64() >> 24) as u8).collect() }
+fn time_seed() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x5DEECE66D) | 1 }
+// The fixed Diffie-Hellman groups by name, so a key share of the right size can be built.
+fn dh_group_bits(kex: &str) -> Option<u64> {
+    [("diffie-hellman-group1-", 1024), ("diffie-hellman-group14-", 2048), ("diffie-hellman-group15-", 3072),
+     ("diffie-hellman-group16-", 4096), ("diffie-hellman-group17-", 6144), ("diffie-hellman-group18-", 8192)]
+        .iter().find(|(p, _)| kex.starts_with(p)).map(|(_, b)| *b)
+}
+// NIST P-256 base point, uncompressed (SEC 1). A valid curve point is all the server checks.
+fn p256_generator() -> Vec<u8> {
+    let mut v = vec![4u8];
+    v.extend(BigUint::parse_bytes(b"6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296", 16).unwrap().to_bytes_be());
+    v.extend(BigUint::parse_bytes(b"4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5", 16).unwrap().to_bytes_be());
+    v
+}
+// A well-formed ML-KEM-768 encapsulation key (FIPS 203): 768 coefficients below q = 3329,
+// packed 12 bits each, then a 32-byte seed. Servers run the FIPS 203 modulus check on it.
+fn mlkem768_ek(rng: &mut Xorshift) -> Vec<u8> {
+    let mut coeffs = Vec::with_capacity(768);
+    while coeffs.len() < 768 { let c = (rng.next_u64() & 0xFFF) as u16; if c < 3329 { coeffs.push(c); } }
+    let mut out = Vec::with_capacity(1184);
+    for pair in coeffs.chunks(2) {
+        let (a, b) = (pair[0], pair[1]);
+        out.push((a & 0xFF) as u8); out.push(((a >> 8) | ((b & 0xF) << 4)) as u8); out.push((b >> 4) as u8);
+    }
+    out.extend(rand_bytes(rng, 32));
+    out
+}
+// The client's first key exchange message for a negotiated kex: KEXDH_INIT or KEX_ECDH_INIT
+// (message 30) with a share the server accepts. The share is random: the probe never needs the
+// shared secret, only the server's signed reply. None = a kex this probe cannot complete.
+fn kex_init_payload(kex: &str, rng: &mut Xorshift) -> Option<Vec<u8>> {
+    let k = kex.to_lowercase();
+    let mut pl = vec![30u8];
+    if let Some(bits) = dh_group_bits(&k) {
+        pl.extend(mpint(&rand_biguint(rng, bits - 8)));   // 1 < e < p - 1, many bits set
+        return Some(pl);
+    }
+    let share = if k.starts_with("curve25519-sha256") { rand_bytes(rng, 32) }
+        else if k.starts_with("curve448-sha512") { rand_bytes(rng, 56) }
+        else if k == "ecdh-sha2-nistp256" { p256_generator() }
+        else if k.starts_with("sntrup761x25519-sha512") { let mut v = rand_bytes(rng, 1158); v.extend(rand_bytes(rng, 32)); v }
+        else if k.starts_with("mlkem768x25519-sha256") { let mut v = mlkem768_ek(rng); v.extend(rand_bytes(rng, 32)); v }
+        else { return None };
+    pl.extend(ssh_string(&share));
+    Some(pl)
+}
+// p from a KEX_DH_GEX_GROUP payload (message 31: mpint p, mpint g)
+fn parse_gex_p(payload: &[u8]) -> Option<BigUint> {
+    if payload.len() < 5 || payload[0] != 31 { return None; }
+    let n = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+    if n == 0 || n > 2048 || payload.len() < 5 + n { return None; }
+    Some(BigUint::from_bytes_be(&payload[5..5 + n]))
+}
 // scan the cleartext SSH stream for a packet of the given message type
-fn ssh_has_msg(buf: &[u8], msg: u8) -> bool {
+fn ssh_has_msg(buf: &[u8], msg: u8) -> bool { ssh_find_payload(buf, msg).is_some() }
+fn ssh_find_payload(buf: &[u8], msg: u8) -> Option<Vec<u8>> {
     let mut i = 0;
     if let Some(p) = find_ident(buf) {
         if let Some(nl) = buf[p..].iter().position(|&b| b == b'\n') { i = p + nl + 1; }
@@ -1349,13 +1472,15 @@ fn ssh_has_msg(buf: &[u8], msg: u8) -> bool {
         let pad = buf[i + 4] as usize;
         let payload_start = i + 5;
         let payload_end = (i + 4 + pkt_len).saturating_sub(pad);   // hostile pad must not underflow
-        if payload_end > payload_start && payload_end <= buf.len() && buf[payload_start] == msg { return true; }
+        if payload_end > payload_start && payload_end <= buf.len() && buf[payload_start] == msg {
+            return Some(buf[payload_start..payload_end].to_vec());
+        }
         i += 4 + pkt_len;
     }
-    false
+    None
 }
 #[derive(PartialEq, Debug)]
-enum Down { Accepted, Refused, Unknown }
+enum Down { Completed, Accepted, Refused, Unknown }
 fn live_downgrade(ip: Ipv4Addr, port: u16, kex: &str, hostkeys: &str, cipher: &str, mac: &str, timeout: Duration) -> Down {
     let addr = SocketAddr::new(IpAddr::V4(ip), port);
     let mut stream = match TcpStream::connect_timeout(&addr, timeout) { Ok(s) => s, Err(_) => return Down::Unknown };
@@ -1369,14 +1494,46 @@ fn live_downgrade(ip: Ipv4Addr, port: u16, kex: &str, hostkeys: &str, cipher: &s
     }
     if stream.write_all(&build_kexinit(kex, hostkeys, cipher, mac)).is_err() { return Down::Unknown; }
     let start = Instant::now();
-    // ponytail: heuristic; a host that agrees and then idles looks like a slow one, which is
-    // why accepted is only ever reported for an algorithm the server itself listed
+    let mut verdict = Down::Accepted;
     loop {
         let r = stream.read(&mut tmp);
         if let Ok(n) = &r { buf.extend_from_slice(&tmp[..*n]); }
-        if let Some(v) = verdict_from_read(&r, ssh_has_msg(&buf, 1)) { return v; }
-        if start.elapsed() > timeout { return Down::Accepted; }
+        if let Some(v) = verdict_from_read(&r, ssh_has_msg(&buf, 1)) { verdict = v; break; }
+        if start.elapsed() > timeout { break; }
     }
+    if verdict != Down::Accepted { return verdict; }
+    // The server agreed and waits. Send our key exchange message: a reply signed with the host
+    // key proves the server really runs the exchange with the weak proposal. If this step fails
+    // (a kex the probe cannot build, a share the server dislikes) the verdict stays accepted,
+    // because the negotiation already succeeded; it is never turned into refused.
+    if complete_kex(&mut stream, &mut buf, kex, timeout) { Down::Completed } else { Down::Accepted }
+}
+fn read_msg(stream: &mut TcpStream, buf: &mut Vec<u8>, msg: u8, timeout: Duration) -> Option<Vec<u8>> {
+    let start = Instant::now();
+    let mut tmp = [0u8; 8192];
+    loop {
+        if let Some(p) = ssh_find_payload(buf, msg) { return Some(p); }
+        if ssh_has_msg(buf, 1) || start.elapsed() > timeout || buf.len() > 200_000 { return None; }
+        match stream.read(&mut tmp) { Ok(0) | Err(_) => return ssh_find_payload(buf, msg), Ok(n) => buf.extend_from_slice(&tmp[..n]) }
+    }
+}
+fn complete_kex(stream: &mut TcpStream, buf: &mut Vec<u8>, kex: &str, timeout: Duration) -> bool {
+    let mut rng = Xorshift(time_seed());
+    if kex.to_lowercase().starts_with("diffie-hellman-group-exchange") {
+        // RFC 4419: request a group, then send e for the group the server chose
+        let mut req = vec![34u8];
+        for v in [1024u32, 2048, 8192] { req.extend_from_slice(&v.to_be_bytes()); }
+        if stream.write_all(&ssh_packet(&req)).is_err() { return false; }
+        let Some(p) = read_msg(stream, buf, 31, timeout).as_deref().and_then(parse_gex_p) else { return false };
+        if p.bits() < 512 { return false; }
+        let mut init = vec![32u8];
+        init.extend(mpint(&rand_biguint(&mut rng, p.bits() - 8)));
+        if stream.write_all(&ssh_packet(&init)).is_err() { return false; }
+        return read_msg(stream, buf, 33, timeout).is_some();
+    }
+    let Some(pl) = kex_init_payload(kex, &mut rng) else { return false };
+    if stream.write_all(&ssh_packet(&pl)).is_err() { return false; }
+    read_msg(stream, buf, 31, timeout).is_some()
 }
 // The active downgrade test: one live probe per weak algorithm the server lists (see
 // build_probes). Accepted means a weak session can really be established, which is what an
@@ -1398,11 +1555,14 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
             println!("    {} no weak kex/cipher/mac in the offer", paint("ok", "92"));
             match live_downgrade(*ip, port, "diffie-hellman-group1-sha1", &hk, "3des-cbc", "hmac-md5", timeout) {
                 Down::Refused => println!("    {} weak-only proposal refused (server disconnect)", paint(" refused ", "1;37;42")),
+                Down::Completed => println!("    {} weak-only proposal: the server ran a key exchange with algorithms it never listed",
+                                            paint(" DOWNGRADE ACCEPTED ", "1;37;41")),
                 // a server cannot negotiate algorithms it never offered, so silence is not acceptance
                 _ => println!("    {} server stayed silent, but it offers nothing weak, so no downgrade is possible", dim("note")),
             }
             continue;
         }
+        let (total, mut acc, mut done) = (probes.len(), 0, 0);
         for pr in probes {
             let (cat, _, _) = score(policy, pr.ctype, &pr.weak);
             println!("    {} offers weak {} {} [{}]", paint("!", "91"), pr.ctype, bold(&pr.weak), paint(&cat, cat_fg(&cat)));
@@ -1411,10 +1571,17 @@ fn downgrade_cmd(targets: &str, port: u16, timeout: Duration, policy: &Value) {
                 continue;
             };
             match live_downgrade(*ip, port, &k, &hk, &c, &m, timeout) {
-                Down::Accepted => println!("      {} {k} / {c} / {m}", paint(" DOWNGRADE ACCEPTED ", "1;37;41")),
+                Down::Completed => { acc += 1; done += 1; println!("      {} {k} / {c} / {m}", paint(" DOWNGRADE ACCEPTED ", "1;37;41")) }
+                Down::Accepted => { acc += 1; println!("      {} {k} / {c} / {m} {}", paint(" DOWNGRADE ACCEPTED ", "1;37;41"), dim("(negotiated, no signed reply)")) }
                 Down::Refused  => println!("      {} {k} / {c} / {m}", paint(" refused ", "1;37;42")),
                 Down::Unknown  => println!("      {} live probe inconclusive", dim("note")),
             }
+        }
+        if acc == 0 {
+            println!("    {} 0 of {total} weak probes accepted", paint("=>", "92"));
+        } else {
+            println!("    {} {acc} of {total} weak probes accepted; in {done} of them the server completed the key exchange and signed it",
+                     paint("=>", "91"));
         }
     }
     println!();
@@ -2076,7 +2243,7 @@ fn build_findings_digest(recs: &[Record]) -> (String, &'static str, f64) {
         for r in weak.iter().take(8) {
             // only the algorithm names: the per-rule rationale lists families (RC4, null, export)
             // a host may not have, and a small model repeats them as findings
-            d.push_str(&format!("  - {} {} [{}]\n", clean(&r.ctype), clean(&r.value), clean(&r.category)));
+            d.push_str(&format!("  - {}: {} [{}]\n", ctype_label(&r.ctype).to_lowercase(), clean(&r.value), clean(&r.category)));
         }
     }
     (d, og, os)
@@ -2154,7 +2321,7 @@ fn ai_report_cmd(outdir: &str, use_ai: bool) {
     let (digest, og, os) = build_findings_digest(&recs);
     let (summary, author) = if use_ai {
         let prompt = format!(
-"You are a cybersecurity report writer. Write an executive summary of 3 to 4 plain sentences for a manager, using ONLY the findings below. State the overall grade exactly as given. Mention the worst host and why it is weak. Do not recommend specific algorithms, do not write a list, headings or markdown, do not use dash characters. Findings:\n\n{digest}");
+"You are a cybersecurity report writer. Write an executive summary of 3 to 4 plain sentences for a manager, using ONLY the findings below. State the overall grade exactly as given. Mention the worst host and why it is weak. Use the words key exchange, host key, cipher and MAC exactly as the findings label them: Diffie-Hellman and ECDH are key exchanges, not ciphers. Do not recommend specific algorithms, do not write a list, headings or markdown, do not use dash characters. Findings:\n\n{digest}");
         // The summary is only accepted if it agrees with the engine: it must name the computed
         // worst host and must not call another host the worst. One retry, then the template.
         let worst = worst_host(&recs);
@@ -2200,24 +2367,33 @@ fn ai_ask_cmd(question: &str, outdir: &str) {
     let recs = load_inventory(&format!("{outdir}/inventory.json"));
     if recs.is_empty() { eprintln!("  {} no inventory at {outdir}/inventory.json (run a scan first)", paint("error", "91")); std::process::exit(2); }
     let (digest, _og, _os) = build_findings_digest(&recs);
+    // ponytail: the engine's plan is NOT in this prompt; with it, llama3.2:3b named the wrong
+    // worst host in 12 of 12 tries. The plan is printed by `report`, the model only answers.
     let prompt = format!(
-"You answer questions about a network's cryptography using ONLY the findings below. Be concise, 2 to 4 plain sentences, no markdown. If the findings do not contain the answer, say so. Do not invent data, do not use dash characters. Findings:\n\n{digest}\n\nQuestion: {question}");
+"You answer questions about a network's cryptography using ONLY the findings below. Be concise, 2 to 4 plain sentences, no markdown. If the findings do not contain the answer, say so. Do not invent data, do not use dash characters. Diffie-Hellman and ECDH are key exchanges, not ciphers. Findings:\n\n{digest}\n\nQuestion: {question}");
     println!("\n  {} {question}", bold("Q:"));
     eprintln!("  {} asking the local model {} (up to 90s)...", paint("ai", "96"), OLLAMA_MODEL);
-    match ollama_generate(&prompt) {
-        Some(t) => {
-            let t = clean_model_text(&t);
-            println!("  {} {}\n", bold("A:"), t);
-            // an answer cannot be verified in general, but a claim about the worst host can
-            let hosts: BTreeSet<String> = recs.iter().map(|r| r.host.clone()).collect();
-            if let Some((w, ws)) = worst_host(&recs) {
-                if contradicts_worst(&t, &w, &hosts) {
-                    println!("  {} the model named the wrong worst host; the engine says {w} (grade {}, {ws:.0}/100)\n",
-                             paint("check", "93"), grade(ws).0);
-                }
-            }
+    // An answer cannot be verified in general, but a claim about the worst host can: a wrong
+    // one is asked again once, and if it is still wrong the engine answers instead.
+    let hosts: BTreeSet<String> = recs.iter().map(|r| r.host.clone()).collect();
+    let worst = worst_host(&recs);
+    let wrong = |t: &str| worst.as_ref().map_or(false, |(w, _)| contradicts_worst(t, w, &hosts));
+    let first = ollama_generate(&prompt).map(|t| clean_model_text(&t));
+    let reached = first.is_some();
+    let answer = match first {
+        Some(t) if wrong(&t) => ollama_generate(&prompt).map(|t| clean_model_text(&t)).filter(|t| !wrong(t)).ok_or(()),
+        Some(t) => Ok(t),
+        None => Err(()),
+    };
+    match (answer, reached) {
+        (Ok(t), _) => println!("  {} {}\n", bold("A:"), t),
+        (Err(()), true) => {
+            let (w, ws) = worst.clone().unwrap_or_default();
+            let n = recs.iter().filter(|r| r.host == w && r.category == "broken").count();
+            println!("  {} The worst host is {w}, grade {} ({ws:.0}/100), with {n} broken parameter(s).", bold("A:"), grade(ws).0);
+            println!("  {} the model named the wrong worst host twice, so the engine answered\n", paint("check", "93"));
         }
-        None => {
+        (Err(()), false) => {
             eprintln!("  {} local model not reachable (start it with `ollama serve`, then `ollama pull {}`)", paint("note", "93"), OLLAMA_MODEL);
             println!("\n  findings the model would answer from:\n{digest}");
         }
@@ -2267,8 +2443,8 @@ fn usage() -> ! {
     eprintln!(
         "cryptocensus - native SSH/TLS crypto-posture scanner with post-quantum scoring\n\n\
          USAGE:\n  \
-         cryptocensus scan      --targets <IPs|CIDR> [--port 22] [--out ./results] [--concurrency 256] [--timeout-ms 1500] [--policy FILE] [--fail-under A|B|C|D] [--no-color]\n  \
-         cryptocensus tls       --targets <IPs|CIDR> --port 4443\n  \
+         cryptocensus scan      --targets <IPs|CIDR> [--port 22] [--out ./results] [--concurrency 256] [--timeout-ms 1500] [--policy FILE] [--fail-under A|B|C|D] [--append] [--no-color]\n  \
+         cryptocensus tls       --targets <IPs|CIDR> --port 4443 [--out ./results] [--append]\n  \
          cryptocensus fix       --targets <IPs|CIDR> [--port 22] [--out ./results]     post-quantum sshd hardening + the grade it reaches\n  \
          cryptocensus diff      <before.json> <after.json> [--fail-on-regression]      drift between two scans\n  \
          cryptocensus local     [--out ./results]                                      host configuration (sshd, host keys, openssl)\n  \
@@ -2347,6 +2523,7 @@ fn main() {
                 eprintln!("  {} no SSH service answered on {} target(s), port {port}; nothing graded, previous results kept", paint("error", "91"), ips.len());
                 std::process::exit(2);
             }
+            let recs = maybe_append(&args, recs, outdir);
             let stamp = now_iso();
             write_outputs(&recs, outdir, &stamp);
             eprintln!("  {} {} params across {} hosts in {}",
@@ -2387,10 +2564,14 @@ fn main() {
                 std::process::exit(2);
             }
             let stamp = now_iso();
-            write_outputs(&recs, outdir, &stamp);
+            let merged = maybe_append(&args, recs.clone(), outdir);
+            write_outputs(&merged, outdir, &stamp);
             eprintln!("  {} {} TLS endpoint(s) in {}", bold("done"), recs.len(),
                       paint(&format!("{:.3}s", t0.elapsed().as_secs_f64()), "96"));
-            print_summary(&recs, &BTreeMap::new());
+            print_summary(&merged, &BTreeMap::new());
+            if merged.len() > recs.len() {
+                println!("  {} {outdir}/cbom.json now holds SSH and TLS: {} parameters", dim("appended:"), merged.len());
+            }
             for r in &recs {
                 let verdict = if r.category == "pq-ready" { paint("POST-QUANTUM", "92") } else { paint("classical, quantum-vulnerable", "93") };
                 println!("  {}:{} negotiates {} -> {}", r.host, r.port, bold(&r.value), verdict);
