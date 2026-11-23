@@ -1,0 +1,18 @@
+pkgbase = cryptocensus-bin
+	pkgdesc = SSH and TLS crypto audit with post-quantum readiness scoring (release binary)
+	pkgver = 1.1.0
+	pkgrel = 1
+	url = https://github.com/MaqsatKendjebekov/cryptocensus
+	arch = x86_64
+	arch = aarch64
+	license = unknown
+	provides = cryptocensus
+	conflicts = cryptocensus
+	options = !strip
+	options = !debug
+	source_x86_64 = cryptocensus-1.1.0-x86_64.tar.gz::https://github.com/MaqsatKendjebekov/cryptocensus/releases/download/v1.1.0/cryptocensus-x86_64-unknown-linux-musl.tar.gz
+	sha256sums_x86_64 = 9b79f77a5077e69b1f866f77c427c0dfa9c8ee243d3c513ebc12f330c9ca983e
+	source_aarch64 = cryptocensus-1.1.0-aarch64.tar.gz::https://github.com/MaqsatKendjebekov/cryptocensus/releases/download/v1.1.0/cryptocensus-aarch64-unknown-linux-musl.tar.gz
+	sha256sums_aarch64 = 4563b58e251fd96bd1bb3e1d28fe6eafb89aec3b9be12a8a96782360bfcbbb5c
+
+pkgname = cryptocensus-bin

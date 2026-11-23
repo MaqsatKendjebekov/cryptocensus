@@ -26,7 +26,7 @@ use num_integer::Integer;
 use num_traits::{One, Zero};
 
 const POLICY_EMBED: &str = include_str!("../policy.json");
-const SSH_IDENT: &[u8] = b"SSH-2.0-cryptocensus_1.0\r\n";
+const SSH_IDENT: &[u8] = concat!("SSH-2.0-cryptocensus_", env!("CARGO_PKG_VERSION"), "\r\n").as_bytes();
 const KEX_SKIP: [&str; 2] = ["ext-info-", "kex-strict-"];
 
 // ---------- ANSI ----------
@@ -66,6 +66,25 @@ fn paint(s: &str, code: &str) -> String {
         s.to_string()
     }
 }
+// A Windows console shows ANSI colours only after virtual-terminal mode is switched on for
+// the handle; where that fails (old console, output redirected) the tool prints plain text.
+#[cfg(windows)]
+fn console_colors() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(n: u32) -> isize;
+        fn GetConsoleMode(h: isize, m: *mut u32) -> i32;
+        fn SetConsoleMode(h: isize, m: u32) -> i32;
+    }
+    // STD_OUTPUT_HANDLE and STD_ERROR_HANDLE; 0x0004 is ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    [-11i32 as u32, -12i32 as u32].iter().all(|&n| unsafe {
+        let h = GetStdHandle(n);
+        let mut m = 0u32;
+        GetConsoleMode(h, &mut m) != 0 && SetConsoleMode(h, m | 0x0004) != 0
+    })
+}
+#[cfg(not(windows))]
+fn console_colors() -> bool { true }
 fn bold(s: &str) -> String { paint(s, "1") }
 fn dim(s: &str) -> String { paint(s, "2") }
 fn cat_ansi(cat: &str) -> &'static str {
@@ -183,8 +202,11 @@ fn valid_alg_name(v: &str) -> bool {
 fn parse_kexinit(buf: &[u8]) -> Option<(String, Vec<(String, String)>)> {
     let id_start = find_ident(buf)?;
     let nl = buf[id_start..].iter().position(|&b| b == b'\n')? + id_start;
+    // printable ASCII only, whitespace runs collapsed, at most 255 chars (RFC 4253 4.2), so a
+    // hostile banner can neither inject escapes nor pad itself out to fake lines on screen
     let banner: String = String::from_utf8_lossy(&buf[id_start..nl]).chars()
-        .filter(|c| (' '..='~').contains(c)).collect::<String>().trim().to_string();
+        .filter(|c| (' '..='~').contains(c)).collect::<String>()
+        .split_whitespace().collect::<Vec<_>>().join(" ").chars().take(255).collect();
     let rest = &buf[nl + 1..];
     if rest.len() < 5 { return None; }
     let pkt_len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
@@ -602,7 +624,7 @@ fn build_cbom(recs: &[Record], stamp: &str) -> Value {
     }).collect();
     json!({
         "bomFormat": "CycloneDX", "specVersion": "1.6", "version": 1,
-        "metadata": {"timestamp": stamp, "tools": [{"name": "CryptoCensus", "version": "1.0"}],
+        "metadata": {"timestamp": stamp, "tools": [{"name": "CryptoCensus", "version": env!("CARGO_PKG_VERSION")}],
                      "component": {"type": "application", "name": "lab-network-crypto-census"}},
         "components": comps
     })
@@ -788,6 +810,158 @@ fn print_summary(recs: &[Record], banners: &BTreeMap<String, String>) {
     let _ = banners;
 }
 
+// Under the table: what each endpoint offers, what it means and what to run next, so the
+// names are on screen and nobody has to open a file to see them.
+// ponytail: details for the 5 lowest-graded endpoints only; every one is in report.html.
+fn print_findings(recs: &[Record], banners: &BTreeMap<String, String>, scan_port: u16, outdir: &str) {
+    let mut eps: BTreeMap<(&str, u16, &str), Vec<&Record>> = BTreeMap::new();
+    for r in recs { eps.entry((r.host.as_str(), r.port, r.service.as_str())).or_default().push(r); }
+    let mut order: Vec<((&str, u16, &str), Vec<&Record>)> = eps.into_iter().collect();
+    order.sort_by(|a, b| readiness(&a.1).total_cmp(&readiness(&b.1)));
+    let pad = " ".repeat(13);
+    for ((host, port, service), rs) in order.iter().take(5) {
+        let ssh = *service == "ssh";
+        let banner = if ssh && *port == scan_port { banners.get(*host).map(String::as_str) } else { None };
+        out!("  {} {}  {}", bold("findings"), bold(&format!("{host}:{port} {service}")), dim(banner.unwrap_or("")));
+        for (cat, label) in [("broken", "broken"), ("legacy-classical", "legacy"), ("quantum-vulnerable", "quantum"),
+                             ("pq-ready", "pq"), ("unclassified", "unknown")] {
+            let in_cat: Vec<&&Record> = rs.iter().filter(|r| r.category == cat).collect();
+            let mut head = format!("{label:<8}{:>3}  ", in_cat.len());
+            for ct in ["kex", "hostkey", "cipher", "mac", "tls_group", "tls_version", "cert_sig", "library"] {
+                let names: Vec<&str> = in_cat.iter().filter(|r| r.ctype == ct).map(|r| r.value.as_str()).collect();
+                if names.is_empty() { continue; }
+                for line in wrap_names(&ctype_label(ct).to_lowercase(), &names, 92) {
+                    out!("    {}{line}", paint(&head, cat_fg(cat)));
+                    head = pad.clone();
+                }
+            }
+        }
+        let client = if ssh { ssh_client_lists(host) } else { None };
+        for (i, v) in host_verdict(rs, banner, client.as_ref()).iter().enumerate() {
+            out!("    {}{v}", bold(if i == 0 { "verdict      " } else { "             " }));
+        }
+        let mut next = Vec::new();
+        if ssh && rs.iter().any(|r| r.category != "pq-ready" && !hardened_keeps(&r.value)) {
+            next.push(format!("cryptocensus fix --targets {host} --port {port} --out {}   {}", shell_quote(outdir), dim("hardened config + the grade it reaches")));
+        }
+        // downgrade probes key exchange, cipher and MAC only, never the host key
+        if ssh && rs.iter().any(|r| matches!(r.ctype.as_str(), "kex" | "cipher" | "mac") && matches!(r.category.as_str(), "broken" | "legacy-classical")) {
+            next.push(format!("cryptocensus downgrade --targets {host} --port {port}   {}", dim("proves the weak ones live, only on servers you may test")));
+        }
+        for (i, n) in next.iter().enumerate() {
+            out!("    {}{n}", bold(if i == 0 { "next         " } else { "             " }));
+        }
+        out!("");
+    }
+    if order.len() > 5 { out!("  {} more endpoint(s) graded: every finding is in {outdir}/report.html\n", order.len() - 5); }
+}
+
+// "label: a, b, c" wrapped at width, continuation lines indented under the first name.
+fn wrap_names(label: &str, names: &[&str], width: usize) -> Vec<String> {
+    let indent = " ".repeat(label.len() + 2);
+    let (mut lines, mut cur, mut empty) = (Vec::new(), format!("{label}: "), true);
+    for (i, n) in names.iter().enumerate() {
+        let piece = if i + 1 < names.len() { format!("{n},") } else { n.to_string() };
+        if !empty && cur.len() + 1 + piece.len() > width { lines.push(cur); cur = indent.clone(); empty = true; }
+        if !empty { cur.push(' '); }
+        cur.push_str(&piece);
+        empty = false;
+    }
+    lines.push(cur);
+    lines
+}
+
+// What the menu means. SSH takes the client's first choice that the server also offers, so
+// every classical key exchange a server still offers is a real path to a recordable session.
+fn host_verdict(rs: &[&Record], banner: Option<&str>, client: Option<&ClientLists>) -> Vec<String> {
+    let mut v = Vec::new();
+    let count = |c: &str| rs.iter().filter(|r| r.category == c).count();
+    let (b, l) = (count("broken"), count("legacy-classical"));
+    if b > 0 { v.push(format!("{b} broken: unsafe today, no quantum computer needed")); }
+    if l > 0 { v.push(format!("{l} legacy: deprecated, phase them out")); }
+    let kex: Vec<&&Record> = rs.iter().filter(|r| r.ctype == "kex").collect();
+    if !kex.is_empty() {
+        let pq = kex.iter().filter(|r| r.category == "pq-ready").count();
+        let unknown = kex.iter().filter(|r| r.category == "unclassified").count();
+        let classical = kex.len() - pq - unknown;
+        v.push(if pq == 0 {
+            format!("no {}post-quantum key exchange: every session can be recorded now and decrypted later",
+                    if unknown > 0 { "recognised " } else { "" })
+        } else if classical == 0 {
+            "only post-quantum key exchange: every session key is agreed post-quantum".to_string()
+        } else {
+            format!("post-quantum key exchange offered, but {classical} classical one(s) too, and the client picks")
+        });
+        if unknown > 0 { v.push(format!("{unknown} unrecognised key exchange(s): check them by hand")); }
+        if !kex.iter().any(|r| r.value.contains("mlkem")) {
+            match openssh_version(banner) {
+                Some(ver) if ver >= (9, 9) => v.push("ML-KEM is built in but not enabled: add mlkem768x25519-sha256 to KexAlgorithms".to_string()),
+                Some(_) => v.push("no ML-KEM: the ML-KEM-768 (FIPS 203) + X25519 hybrid needs OpenSSH 9.9 or later".to_string()),
+                None if pq > 0 => v.push("no ML-KEM key exchange offered".to_string()),
+                None => {}
+            }
+        }
+        if let Some(c) = client {
+            v.push(match client_outcome(c, rs) {
+                Ok(k) => {
+                    let cat = kex.iter().find(|r| r.value == k).map(|r| r.category.as_str()).unwrap_or("unclassified");
+                    format!("from this machine, ssh would negotiate {} [{cat}]", paint(&k, cat_fg(cat)))
+                }
+                Err(why) => format!("from this machine, ssh cannot connect with its current settings: {why}"),
+            });
+            let hk: Vec<&str> = rs.iter().filter(|r| r.ctype == "hostkey").map(|r| r.value.as_str()).collect();
+            if v.last().is_some_and(|l| l.contains("no common host key")) && !hk.is_empty() && hk.iter().all(|h| h.contains("mldsa")) {
+                v.push("ML-DSA host keys are opt-in before OpenSSH 10.6: HostKeyAlgorithms +ssh-mldsa44-ed25519@openssh.com".to_string());
+            }
+        }
+    }
+    let hk: Vec<&&Record> = rs.iter().filter(|r| r.ctype == "hostkey").collect();
+    if !hk.is_empty() && hk.iter().all(|r| r.category == "quantum-vulnerable") {
+        v.push("host key classical only: fine for now, it matters for live attacks, not recorded traffic".to_string());
+    }
+    v
+}
+
+// "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13" -> (9, 6); None for other SSH software.
+fn openssh_version(banner: Option<&str>) -> Option<(u32, u32)> {
+    let rest = banner?.split("OpenSSH_").nth(1)?;
+    let mut nums = rest.split(|c: char| !c.is_ascii_digit()).filter(|n| !n.is_empty());
+    Some((nums.next()?.parse().ok()?, nums.next()?.parse().ok()?))
+}
+
+// RFC 4253 7.1: the first entry on the client's list that the server also offers.
+fn negotiate(client_list: &str, server: &[&str]) -> Option<String> {
+    client_list.split(',').map(str::trim)
+        .filter(|k| !KEX_SKIP.iter().any(|s| k.starts_with(s)))
+        .find(|k| server.contains(k)).map(str::to_string)
+}
+// The ssh client on this machine, from its own `ssh -G` config for that host.
+struct ClientLists { kex: String, hostkey: String, cipher: String, mac: String }
+fn ssh_client_lists(host: &str) -> Option<ClientLists> {
+    let out = Command::new("ssh").args(["-G", host]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    let get = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)).map(str::to_string);
+    Some(ClientLists { kex: get("kexalgorithms ")?, hostkey: get("hostkeyalgorithms ")?, cipher: get("ciphers ")?, mac: get("macs ")? })
+}
+// The key exchange that client gets, slot by slot, or why it cannot connect at all (a legacy
+// server with only an ssh-rsa host key, for example). AEAD ciphers carry their own MAC.
+fn client_outcome(c: &ClientLists, rs: &[&Record]) -> Result<String, String> {
+    let server = |ct: &str| rs.iter().filter(|r| r.ctype == ct).map(|r| r.value.as_str()).collect::<Vec<_>>();
+    let kex = negotiate(&c.kex, &server("kex")).ok_or("no common key exchange")?;
+    negotiate(&c.hostkey, &server("hostkey"))
+        .ok_or_else(|| format!("no common host key algorithm (server offers {})", server("hostkey").join(", ")))?;
+    let cipher = negotiate(&c.cipher, &server("cipher")).ok_or("no common cipher")?;
+    if !(cipher.contains("-gcm") || cipher.contains("poly1305")) {
+        negotiate(&c.mac, &server("mac")).ok_or("no common MAC")?;
+    }
+    Ok(kex)
+}
+// A path that pastes back into a shell unchanged.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c)) { s.to_string() }
+    else { format!("'{}'", s.replace('\'', "'\\''")) }
+}
+
 fn cat_bg_for_grade(g: &str) -> &'static str {
     match g {
         "A" | "B" => "1;37;42",
@@ -849,6 +1023,30 @@ fn selftest() {
     assert!(ssh_has_msg(&pkt, 20), "built KEXINIT must contain SSH_MSG_KEXINIT (20)");
     assert!(!ssh_has_msg(&pkt, 1), "built KEXINIT is not a DISCONNECT");
     println!("{}", paint("lifecycle self-checks passed: remediation grade A, drift scoring, SARIF levels, KEXINIT framing", "92"));
+    // findings block: the client's first choice wins (RFC 4253 7.1), pseudo-algorithms never count
+    assert_eq!(negotiate("ecdh-sha2-nistp256,mlkem768x25519-sha256,ext-info-c", &["mlkem768x25519-sha256", "ecdh-sha2-nistp256"]).as_deref(), Some("ecdh-sha2-nistp256"));
+    assert_eq!(negotiate("kex-strict-c-v00@openssh.com,curve25519-sha256", &["kex-strict-c-v00@openssh.com"]), None);
+    let mk = |ctype: &str, value: &str, cat: &str| Record { host: "h".into(), port: 22, service: "ssh".into(), ctype: ctype.into(),
+        value: value.into(), category: cat.into(), why: String::new(), source: String::new() };
+    let rs = [mk("kex", "sntrup761x25519-sha512@openssh.com", "pq-ready"), mk("kex", "curve25519-sha256", "quantum-vulnerable"),
+              mk("hostkey", "ssh-ed25519", "quantum-vulnerable"), mk("cipher", "aes256-gcm@openssh.com", "pq-ready")];
+    let modern = ClientLists { kex: "ecdh-sha2-nistp256,curve25519-sha256".into(), hostkey: "ssh-ed25519".into(),
+        cipher: "aes256-gcm@openssh.com".into(), mac: "hmac-sha2-256".into() };
+    let v = host_verdict(&rs.iter().collect::<Vec<_>>(), Some("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13"), Some(&modern)).join(" | ");
+    assert!(v.contains("1 classical") && v.contains("needs OpenSSH 9.9") && v.contains("negotiate") && v.contains("host key classical"), "findings verdict: {v}");
+    // a legacy server with only an ssh-rsa host key: a modern client cannot connect at all, and ssh-rsa is never "fine"
+    let old = [mk("kex", "diffie-hellman-group14-sha1", "legacy-classical"), mk("hostkey", "ssh-rsa", "legacy-classical"),
+               mk("cipher", "aes128-ctr", "quantum-vulnerable"), mk("mac", "hmac-sha1", "legacy-classical")];
+    let oldc = ClientLists { kex: "diffie-hellman-group14-sha1".into(), hostkey: "ssh-ed25519,rsa-sha2-512".into(),
+        cipher: "aes128-ctr".into(), mac: "hmac-sha1".into() };
+    assert_eq!(client_outcome(&oldc, &old.iter().collect::<Vec<_>>()), Err("no common host key algorithm (server offers ssh-rsa)".to_string()));
+    let v2 = host_verdict(&old.iter().collect::<Vec<_>>(), Some("SSH-2.0-OpenSSH_10.0"), None).join(" | ");
+    assert!(v2.contains("built in but not enabled") && !v2.contains("fine for now"), "findings verdict: {v2}");
+    assert_eq!(openssh_version(Some("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20")), Some((9, 6)));
+    assert_eq!(openssh_version(Some("SSH-2.0-dropbear_2022.83")), None);
+    assert_eq!(wrap_names("kex", &["aaaa", "bbbb", "cccc"], 12), ["kex: aaaa,", "     bbbb,", "     cccc"]);
+    assert_eq!(shell_quote("my audit"), "'my audit'");
+    println!("{}", paint("findings self-checks passed: client-first negotiation, no common host key, ML-KEM advice by version, wrapping", "92"));
     robustness_selftest(&policy);
     // advanced methods O7, O8, O10
     shor_selftest();
@@ -1091,8 +1289,8 @@ fn build_sarif(recs: &[Record]) -> Value {
     json!({
         "version": "2.1.0", "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "runs": [{
-            "tool": {"driver": {"name": "CryptoCensus", "version": "1.0",
-                     "informationUri": "https://localhost/cryptocensus", "rules": rules}},
+            "tool": {"driver": {"name": "CryptoCensus", "version": env!("CARGO_PKG_VERSION"),
+                     "informationUri": env!("CARGO_PKG_REPOSITORY"), "rules": rules}},
             "results": results
         }]
     })
@@ -2602,7 +2800,8 @@ fn usage() -> ! {
          cryptocensus report    [--ai] [--out ./results]                               executive brief from the findings (local model with --ai, template otherwise)\n  \
          cryptocensus ask       \"<question>\" [--out ./results]                          ask the local model about the findings (never changes a verdict)\n  \
          cryptocensus bench     --targets <IPs|CIDR> [--nmap]\n  \
-         cryptocensus selftest\n\n\
+         cryptocensus selftest\n  \
+         cryptocensus --version\n\n\
          EXAMPLES:\n  \
          cryptocensus scan  --targets 192.168.56.0/24 --out results --fail-under B\n  \
          cryptocensus fix   --targets 192.168.56.111 --out results\n  \
@@ -2641,7 +2840,13 @@ fn num_flag<T: std::str::FromStr + PartialOrd + Copy + std::fmt::Display>(args: 
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--no-color") { USE_COLOR.store(0, Ordering::Relaxed); }
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V" | "version")) {
+        println!("cryptocensus {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| a == "--no-color") || std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) || !console_colors() {
+        USE_COLOR.store(0, Ordering::Relaxed);
+    }
     if args.iter().any(|a| a == "--json") { JSON_OUT.store(1, Ordering::Relaxed); USE_COLOR.store(0, Ordering::Relaxed); }
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
     let port: u16 = num_flag(&args, "--port", 22u16, 1, 65535);
@@ -2679,6 +2884,7 @@ fn main() {
                       recs.iter().map(|r| r.host.clone()).collect::<BTreeSet<_>>().len(),
                       paint(&format!("{:.3}s", t0.elapsed().as_secs_f64()), "96"));
             print_summary(&recs, &banners);
+            print_findings(&recs, &banners, port, outdir);
             out!("  {} {outdir}/inventory.json | {outdir}/cbom.json | {outdir}/report.html | {outdir}/cryptocensus.sarif",
                      dim("written:"));
             let mut doc = inventory_json(&recs);

@@ -5,6 +5,51 @@ the wire, scores every algorithm for post-quantum readiness against cited
 standards, grades the host, writes a CycloneDX 1.6 CBOM, proves the fix, and can
 write the report with a local model. One Rust binary, dependency-light.
 
+## Install
+
+macOS or Linux (any distribution), no sudo:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/MaqsatKendjebekov/cryptocensus/master/install.sh | sh
+```
+
+Homebrew (macOS, Linux):
+
+```sh
+brew install maqsatkendjebekov/tap/cryptocensus
+```
+
+Debian, Ubuntu, Kali (apt):
+
+```sh
+f=$(mktemp --suffix=.deb) && curl -fsSLo "$f" https://github.com/MaqsatKendjebekov/cryptocensus/releases/latest/download/cryptocensus_$(dpkg --print-architecture).deb && chmod 644 "$f" && sudo apt install "$f"
+```
+
+Arch Linux on x86_64 (pacman; on aarch64 use the first command or `packaging/aur`):
+
+```sh
+f=$(mktemp --suffix=.pkg.tar.zst) && curl -fsSLo "$f" https://github.com/MaqsatKendjebekov/cryptocensus/releases/latest/download/cryptocensus-x86_64.pkg.tar.zst && sudo pacman -U "$f"
+```
+
+Windows (PowerShell, no admin):
+
+```powershell
+irm https://raw.githubusercontent.com/MaqsatKendjebekov/cryptocensus/master/install.ps1 | iex
+```
+
+Anywhere with Rust:
+
+```sh
+cargo install --git https://github.com/MaqsatKendjebekov/cryptocensus
+```
+
+The two install scripts check the SHA-256 of the download against the release's
+`SHA256SUMS` and run the binary's self-test before they install it; nothing is installed
+if either fails. `CRYPTOCENSUS_VERSION=1.1.0` pins a release. The Linux binaries are static (musl), so one build
+runs on every distribution. All release files are built by `release.sh`. The Windows
+build compiles and links, but it has not been tested on a Windows machine yet.
+`packaging/aur/` holds a `cryptocensus-bin` PKGBUILD for the AUR.
+
 CryptoCensus is not a port scanner. It speaks SSH at the protocol level: after
 the version exchange a server sends its `SSH_MSG_KEXINIT` in the clear, listing
 every key exchange, host key, cipher and MAC it supports. CryptoCensus reads that
@@ -20,25 +65,62 @@ remediation plan.
 
 ![The HTML dashboard for a two-host lab](docs/dashboard.png)
 
-## Quick start
+## First scan
+
+```sh
+cryptocensus scan  --targets 192.0.2.10 --out audit   # read and grade the server's SSH crypto
+cryptocensus fix   --targets 192.0.2.10 --out audit   # hardened sshd config + the grade it reaches
+cryptocensus local --out audit                        # this machine: host keys, OpenSSL, ssh client
+cryptocensus report --out audit                       # HTML dashboard: audit/heatmap.html
+```
+
+Only scan systems you own or are allowed to test.
+
+Under the grade table the scan names every algorithm by verdict, says what the menu
+means (including what the ssh client on your machine would negotiate, or that it cannot
+connect at all), and prints the next command. A default Ubuntu 24.04 server (OpenSSH 9.6p1),
+scanned from a Mac:
 
 ```
+  host             grade  readiness   broken legacy quantum pq   bar
+  ------------------------------------------------------------------------------
+  192.0.2.10        D       57/100       0      4      16   10   ██████████████████████████████
+  ------------------------------------------------------------------------------
+  OVERALL network readiness  D  57/100   (30 params, 1 hosts)
+
+  findings 192.0.2.10:22 ssh  SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20
+    legacy    4  mac: umac-64-etm@openssh.com, hmac-sha1-etm@openssh.com, umac-64@openssh.com, hmac-sha1
+    quantum  16  key exchange: curve25519-sha256, curve25519-sha256@libssh.org, ecdh-sha2-nistp256,
+                               ecdh-sha2-nistp384, ecdh-sha2-nistp521, diffie-hellman-group-exchange-sha256,
+                               diffie-hellman-group16-sha512, diffie-hellman-group18-sha512,
+                               diffie-hellman-group14-sha256
+                 host key: rsa-sha2-512, rsa-sha2-256, ecdsa-sha2-nistp256, ssh-ed25519
+                 cipher: aes128-ctr, aes192-ctr, aes128-gcm@openssh.com
+    pq       10  key exchange: sntrup761x25519-sha512@openssh.com
+                 cipher: chacha20-poly1305@openssh.com, aes256-ctr, aes256-gcm@openssh.com
+                 mac: umac-128-etm@openssh.com, hmac-sha2-256-etm@openssh.com, hmac-sha2-512-etm@openssh.com,
+                      umac-128@openssh.com, hmac-sha2-256, hmac-sha2-512
+    verdict      4 legacy: deprecated, phase them out
+                 post-quantum key exchange offered, but 9 classical one(s) too, and the client picks
+                 no ML-KEM: the ML-KEM-768 (FIPS 203) + X25519 hybrid needs OpenSSH 9.9 or later
+                 from this machine, ssh would negotiate ecdh-sha2-nistp256 [quantum-vulnerable]
+                 host key classical only: fine for now, it matters for live attacks, not recorded traffic
+    next         cryptocensus fix --targets 192.0.2.10 --port 22 --out audit   hardened config + the grade it reaches
+                 cryptocensus downgrade --targets 192.0.2.10 --port 22   proves the weak ones live, only on servers you may test
+```
+
+## Build from source
+
+```sh
 git clone https://github.com/MaqsatKendjebekov/cryptocensus && cd cryptocensus
-cargo build --release
-./target/release/cryptocensus selftest
-./target/release/cryptocensus scan --targets 192.168.56.0/24 --out results
-./target/release/cryptocensus report --out results     # then open results/heatmap.html
-```
-
-## Build
-
-```
 cargo build --release
 ./target/release/cryptocensus selftest
 ```
 
 Pure standard library plus `serde_json`; `num-bigint`, `num-integer` and
-`num-traits` are used only by the batch-GCD command.
+`num-traits` are used only by the batch-GCD command. `./release.sh` builds every
+release file (macOS, Linux, Windows, `.deb`, pacman package, Homebrew formula) on an
+Apple Silicon Mac with Docker.
 
 ## Readiness bands
 
@@ -74,6 +156,7 @@ cryptocensus report    [--ai] [--out ./results]    executive brief and heatmap f
 cryptocensus ask       "<question>" [--out ./results]
 cryptocensus bench     --targets <IPs|CIDR> [--nmap]
 cryptocensus selftest
+cryptocensus --version
 ```
 
 Add `--json` to `scan`, `tls`, `downgrade`, `fix` or `diff` for machine-readable output.
