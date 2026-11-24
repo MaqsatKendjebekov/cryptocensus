@@ -260,6 +260,3 @@ is a reasonable reading of the standards, not a formal proof.
 Built as an Applied Security capstone. Everything was tested in an isolated lab.
 Run it only against hosts you own or are authorised to test.
 
-## Credits
-
-Written by Maksat Kendjebekov. AI assistants (Claude) helped with code review and testing.
